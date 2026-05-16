@@ -2,25 +2,20 @@
   "config": {
     "step": {
       "user": {
-        "title": "Philips Hue — Anmeldung",
-        "description": "Trage deinen Hue Bearer Token ein.\n\n**Token beschaffen:** Öffne die Hue App mit einem Proxy (z.B. mitmproxy / Charles) und kopiere den `Authorization: Bearer …` Header aus einem Request zu `api.account.meethue.com`. Der Token ist ~7 Tage gültig.",
+        "title": "Philips Hue — Login",
+        "description": "**Schritt 1:** Öffne diesen Link in deinem Browser und melde dich mit deinem Philips Hue Konto an:\n\n[Philips Hue Login öffnen]({auth_url})\n\n**Schritt 2:** Nach dem Login wirst du zu `account.meethue.com` weitergeleitet. Kopiere die vollständige URL aus der Adressleiste (sie enthält `?code=...`) und füge sie unten ein.",
         "data": {
-          "bearer_token": "Bearer Token (eyJ…)",
-          "refresh_token": "Refresh Token (optional, für automatische Verlängerung)"
+          "callback_url": "URL aus der Adressleiste nach dem Login"
         }
       },
       "home": {
         "title": "Hue Home auswählen",
-        "data": {
-          "home_id": "Hue Home"
-        }
+        "data": { "home_id": "Hue Home" }
       },
       "manual_home": {
         "title": "Home-ID eingeben",
         "description": "{hint}",
-        "data": {
-          "home_id": "Home-ID (z.B. 4618484926709760)"
-        }
+        "data": { "home_id": "Home-ID (14-stellige Zahl)" }
       },
       "camera": {
         "title": "Kamera wählen",
@@ -32,14 +27,14 @@
       "e2ee": {
         "title": "E2EE-Passphrase",
         "description": "{info}",
-        "data": {
-          "e2ee_passphrase": "E2EE-Passphrase (leer lassen wenn keine gesetzt)"
-        }
+        "data": { "e2ee_passphrase": "E2EE-Passphrase (leer = keine)" }
       }
     },
     "error": {
-      "invalid_token": "Ungültiger Token — muss mit 'eyJ' beginnen.",
-      "no_cameras": "Keine Kameras in diesem Home gefunden. Prüfe Home-ID und Berechtigungen."
+      "no_code": "Keine Anmelde-Code in der URL gefunden. Hast du die vollständige URL aus der Adressleiste kopiert?",
+      "state_mismatch": "Sicherheitsfehler: State stimmt nicht überein. Bitte erneut versuchen.",
+      "token_exchange_failed": "Login fehlgeschlagen. Bitte erneut versuchen.",
+      "no_cameras": "Keine Kameras in diesem Home gefunden."
     },
     "abort": {
       "already_configured": "Diese Kamera ist bereits eingerichtet."
@@ -48,13 +43,21 @@
   "options": {
     "step": {
       "init": {
-        "title": "Token & Passphrase aktualisieren",
+        "title": "Einstellungen",
         "data": {
-          "bearer_token": "Neuer Bearer Token",
-          "refresh_token": "Refresh Token",
+          "action": "Aktion",
           "e2ee_passphrase": "E2EE-Passphrase"
         }
+      },
+      "relogin": {
+        "title": "Neu einloggen",
+        "description": "**Schritt 1:** Öffne diesen Link und melde dich an:\n\n[Philips Hue Login]({auth_url})\n\n**Schritt 2:** Kopiere die URL aus der Adressleiste nach dem Login.",
+        "data": { "callback_url": "URL aus der Adressleiste nach dem Login" }
       }
+    },
+    "error": {
+      "no_code": "Kein Code in der URL gefunden.",
+      "token_exchange_failed": "Login fehlgeschlagen."
     }
   }
 }
