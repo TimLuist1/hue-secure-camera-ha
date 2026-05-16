@@ -1,0 +1,19 @@
+{
+  "domain": "hue_secure_camera",
+  "name": "Philips Hue Secure Camera",
+  "version": "1.0.0",
+  "config_flow": true,
+  "documentation": "https://github.com/timluis/hue-secure-camera-ha",
+  "issue_tracker": "https://github.com/timluis/hue-secure-camera-ha/issues",
+  "requirements": [
+    "aiortc>=1.9.0",
+    "aiohttp>=3.9.0",
+    "boto3>=1.34.0",
+    "websockets>=13.0",
+    "cryptography>=42.0.0",
+    "av>=12.0.0"
+  ],
+  "dependencies": [],
+  "codeowners": [],
+  "iot_class": "cloud_push"
+}

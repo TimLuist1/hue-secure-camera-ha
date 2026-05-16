@@ -1,0 +1,7 @@
+{
+  "name": "Philips Hue Secure Camera",
+  "hacs": "1",
+  "render_readme": false,
+  "homeassistant": "2023.6.0",
+  "filename": "hue_secure_camera.zip"
+}
