@@ -1,7 +1,5 @@
 # Hue Secure Camera — Home Assistant Integration
 
-![Hue Secure Camera](docs/banner.png)
-
 Live-Bild in 1080p, Snapshots und Vollbild-Stream von Philips Hue Secure
 Kameras in Home Assistant — **rein serverseitig** (kein Browser, kein
 Chromium, kein Cloud-Abo).

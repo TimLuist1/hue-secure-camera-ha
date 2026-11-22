@@ -10,6 +10,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .webrtc_bridge import HueWebRTCBridge
+
 from .const import CONF_DEVICE_MAC, CONF_DEVICE_NAME, CONF_HOME_ID, DOMAIN
 from .coordinator import HueCameraCoordinator
 
@@ -66,9 +68,25 @@ class HueSecureCamera(Camera):
             "stream_url": f"/api/hue_secure_camera/stream/{token}/{self._entry_id}",
         }
 
-    @property
-    def frontend_stream_type(self) -> StreamType:
-        return StreamType.HLS
+    async def async_get_webrtc_client_configuration(self):
+        self._bridge = HueWebRTCBridge(self.hass, self._coordinator)
+        return await self._bridge.async_prepare()
+
+    async def async_handle_async_webrtc_offer(self, offer_sdp: str, session_id: str, send_message) -> None:
+        if getattr(self, "_bridge", None) is None:
+            self._bridge = HueWebRTCBridge(self.hass, self._coordinator)
+            await self._bridge.async_prepare()
+        await self._bridge.async_start(offer_sdp, send_message)
+
+    async def async_on_webrtc_candidate(self, session_id: str, candidate) -> None:
+        if getattr(self, "_bridge", None) is not None:
+            data = candidate if isinstance(candidate, dict) else candidate.to_dict()
+            await self._bridge.async_add_candidate(data)
+
+    def close_webrtc_session(self, session_id: str) -> None:
+        if getattr(self, "_bridge", None) is not None:
+            self.hass.async_create_task(self._bridge.async_close())
+            self._bridge = None
 
     @property
     def is_streaming(self) -> bool:
