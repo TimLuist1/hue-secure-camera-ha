@@ -148,10 +148,10 @@ def _kyber768_keygen_from_seed(seed: bytes) -> tuple[bytes, bytes]:
 
     # Pure-Python fallback (requires kyber-py: pip install kyber-py)
     try:
-        from kyber import Kyber768  # type: ignore[import]
+        from kyber_py.ml_kem import ML_KEM_768  # type: ignore[import]
 
-        pk, sk = Kyber768.keygen_derand(seed[:64] if len(seed) >= 64 else seed.ljust(64, b"\x00"))
-        return pk, sk
+        ek, dk = ML_KEM_768.key_derive(seed[:64] if len(seed) >= 64 else seed.ljust(64, b"\x00"))
+        return ek, dk
     except ImportError:
         raise RuntimeError(
             "Kyber768 library not available. "
@@ -171,9 +171,9 @@ def _kyber768_dec(ciphertext: bytes, secret_key: bytes) -> bytes:
         return bytes(ss)
 
     try:
-        from kyber import Kyber768  # type: ignore[import]
+        from kyber_py.ml_kem import ML_KEM_768  # type: ignore[import]
 
-        return Kyber768.dec(secret_key, ciphertext)
+        return ML_KEM_768.decaps(secret_key, ciphertext)
     except ImportError:
         raise RuntimeError("Kyber768 library not available.")
 

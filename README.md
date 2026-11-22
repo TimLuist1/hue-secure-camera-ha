@@ -24,8 +24,9 @@ HA (aiortc) ⇄ Hue Cloud/AWS KVS ⇄ Kamera
         └── H.264/SRTP → JPEG → Entity, MJPEG, Automationen
 ```
 
-E2EE (Passphrase) wird gespeichert, aber noch nicht entschlüsselt – nur nötig,
-wenn in der Hue-App „Verschlüsselte Live-Ansicht“ aktiv ist.
+E2EE (Passphrase) wird gespeichert; die Entschlüsselung ist vorbereitet, aber
+noch nicht getestet – nur nötig, wenn in der Hue-App „Verschlüsselte
+Live-Ansicht“ aktiv ist.
 
 ## Installation (HACS)
 
@@ -56,7 +57,7 @@ entity: camera.abfahrt_garage
 ```
 
 - MJPEG-URL steht als Attribut `stream_url` an der Entity
-- Der Stream startet bei Bedarf und stoppt nach ~2 Minuten Inaktivität
+- Der Stream läuft dauerhaft (Start beim Laden der Integration) und reconnectet automatisch – auch nach Kamera-Timeouts
 
 ## Bekannte Grenzen
 

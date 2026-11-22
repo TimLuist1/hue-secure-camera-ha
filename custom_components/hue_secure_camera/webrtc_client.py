@@ -8,6 +8,7 @@ candidates. Media is decoded by aiortc and delivered as JPEG frames.
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import logging
 import re
@@ -23,10 +24,31 @@ from aiortc import (
 )
 from aiortc.rtcpeerconnection import RTCBundlePolicy
 from aiortc.rtp import RtcpPsfbPacket, RTCP_PSFB_PLI
+from aiortc.rtcrtpreceiver import RTCRtpReceiver
 
 from . import api, signal
+from .e2ee import apply_frame_key_to_rtp, derive_frame_key
 
 _LOGGER = logging.getLogger(__name__)
+
+# The camera sends a DTLS close_notify right after the handshake. Without this
+# patch aiortc tears the whole transport down.
+from aiortc.rtcdtlstransport import RTCDtlsTransport as _RTCDtlsTransport
+
+if not getattr(_RTCDtlsTransport, "_hue_tolerant", False):
+    _orig_recv_next = _RTCDtlsTransport._recv_next
+
+    async def _recv_next_tolerant(self) -> None:
+        try:
+            await _orig_recv_next(self)
+        except ConnectionError:
+            if getattr(self, "_rx_srtp", None) is None:
+                raise
+            _LOGGER.debug("DTLS close_notify ignored (SRTP active)")
+            await asyncio.sleep(0.01)
+
+    _RTCDtlsTransport._recv_next = _recv_next_tolerant  # type: ignore[assignment]
+    _RTCDtlsTransport._hue_tolerant = True  # type: ignore[attr-defined]
 
 OFFER_TEMPLATE = """v=0
 o=hue-ha 0 1 IN IP4 0.0.0.0
@@ -168,6 +190,7 @@ class HueWebRTCClient:
         device_mac: str,
         on_frame: Callable[[bytes], None],
         on_connected: Callable[[bool], None],
+        passphrase: str = "",
     ) -> None:
         self.hass = hass
         self._token_provider = token_provider
@@ -175,11 +198,15 @@ class HueWebRTCClient:
         self._device_mac = device_mac
         self._on_frame = on_frame
         self._on_connected = on_connected
+        self._passphrase = passphrase
+        self._frame_key: Optional[bytes] = None
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._pc: Optional[RTCPeerConnection] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._last_frame = 0.0
+        self._connected_at = 0.0
+        self._got_frames = False
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -223,18 +250,23 @@ class HueWebRTCClient:
                 pass
 
     async def _run(self) -> None:
-        delay = 3
+        delay = 2.0
         while self._running:
+            self._got_frames = False
             try:
                 await self._connect_once()
-                delay = 3
             except asyncio.CancelledError:
                 return
             except Exception as exc:
                 _LOGGER.debug("Hue stream error: %s", exc)
-            if self._running:
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 30)
+            if not self._running:
+                return
+            if self._got_frames:
+                # session was healthy – reconnect quickly
+                delay = 0.5
+            else:
+                delay = min(delay * 2, 20)
+            await asyncio.sleep(delay)
 
     # ── single session ───────────────────────────────────────────────────
 
@@ -276,6 +308,11 @@ class HueWebRTCClient:
         self._pc = pc
         pc.addTransceiver("video", direction="recvonly")
         pc.addTransceiver("audio", direction="recvonly")
+
+        await self._setup_e2ee(pc, creds)
+        if self._frame_key:
+            for receiver in pc.getReceivers():
+                self._patch_receiver(receiver, self._frame_key)
 
         offer = await pc.createOffer()
         sdp = self._build_offer(offer.sdp)
@@ -347,7 +384,15 @@ class HueWebRTCClient:
         async def frame_watchdog() -> None:
             while not ws.closed:
                 await asyncio.sleep(5)
-                if self._last_frame and time.monotonic() - self._last_frame > 20:
+                if self._last_frame:
+                    if time.monotonic() - self._last_frame > 20:
+                        _LOGGER.debug("No frames for 20s, reconnecting")
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                        return
+                elif self._connected_at and time.monotonic() - self._connected_at > 60:
                     _LOGGER.debug("No frames for 20s, reconnecting")
                     try:
                         await ws.close()
@@ -374,6 +419,7 @@ class HueWebRTCClient:
                         RTCSessionDescription(sdp=payload["sdp"], type="answer")
                     )
                     self._on_connected(True)
+                    self._connected_at = time.monotonic()
                 elif action == "ICE_CANDIDATE" and payload.get("candidate"):
                     cand = payload["candidate"]
                     try:
@@ -397,6 +443,42 @@ class HueWebRTCClient:
             except Exception:
                 pass
             self._pc = None
+
+    async def _setup_e2ee(self, pc: RTCPeerConnection, creds: dict[str, Any]) -> None:
+        self._frame_key = None
+        envelope = creds.get("base64KeyEnvelope", "")
+        if not self._passphrase or not envelope:
+            return
+        salt_b64 = creds.get("e2eeSalt", "")
+        salt = (
+            base64.b64decode(salt_b64 + "==")
+            if salt_b64
+            else self._home_id.encode()[:16].ljust(16, b"\x00")
+        )
+        result = await self.hass.async_add_executor_job(
+            derive_frame_key, self._passphrase, salt, envelope
+        )
+        if result:
+            self._frame_key = result.frame_key
+            _LOGGER.debug("E2EE key derived")
+        else:
+            _LOGGER.warning("E2EE key derivation failed")
+
+    @staticmethod
+    def _patch_receiver(receiver: RTCRtpReceiver, key: bytes) -> None:
+        if getattr(receiver, "_hue_fc", False):
+            return
+        receiver._hue_fc = True  # type: ignore[attr-defined]
+        original = receiver._handle_rtp_packet
+
+        async def handler(packet, arrival_time_ms: int) -> None:
+            try:
+                packet.payload = apply_frame_key_to_rtp(packet.payload, key)
+            except Exception:
+                pass
+            await original(packet, arrival_time_ms)
+
+        receiver._handle_rtp_packet = handler  # type: ignore[assignment]
 
     # ── media ────────────────────────────────────────────────────────────
 
@@ -429,6 +511,7 @@ class HueWebRTCClient:
                 except Exception:
                     break
                 self._last_frame = time.monotonic()
+                self._got_frames = True
                 try:
                     image = frame.to_image()
                     buf = io.BytesIO()

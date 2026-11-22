@@ -20,7 +20,7 @@ from .webrtc_client import HueWebRTCClient
 
 _LOGGER = logging.getLogger(__name__)
 
-IDLE_STOP_SECONDS = 120
+IDLE_STOP_SECONDS = 1800
 
 
 class HueCameraCoordinator:
@@ -122,7 +122,7 @@ class HueCameraCoordinator:
             )
         if not self._client._running:
             await self._client.start()
-        if self._idle_task is None or self._idle_task.done():
+        if False and (self._idle_task is None or self._idle_task.done()):
             self._idle_task = self.hass.async_create_background_task(
                 self._idle_loop(), f"hue idle {self.entry_id}"
             )
