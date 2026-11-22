@@ -3,17 +3,23 @@
     "step": {
       "auth": {
         "title": "Philips Hue Login",
-        "description": "1. Öffne diesen Link und melde dich an:\n\n{url}\n\n2. Kopiere danach die komplette URL aus der Adresszeile (beginnend mit https://account.meethue.com/?code=...) und füge sie unten ein.",
-        "data": { "callback_url": "Redirect-URL" }
+        "description": "**Vorab:**\n1. Hue-Konto mit eingerichteter Secure-Kamera nötig.\n2. In der Hue-App unter *Einstellungen → Sicherheit → Videoüberwachung* die **E2EE / verschlüsselte Live-Ansicht AUS** schalten – sonst bleibt das Bild verschlüsselt.\n3. **Home-ID** (16 Ziffern) bereitlegen: im [Hue-Konto-Portal]({portal}) anmelden, dein Zuhause öffnen, ID steht in der Adresszeile hinter `/homes/`.\n\n**Login:**\nÖffne diesen Link und melde dich an:\n\n{url}\n\nDanach die komplette Redirect-URL (`https://account.meethue.com/?code=...`) unten einfügen.",
+        "data": {
+          "callback_url": "Redirect-URL"
+        }
       },
       "home": {
-        "title": "Home-ID",
-        "description": "16-stellige Home-ID deines Hue-Kontos. Beispiel: 4618484926709760",
-        "data": { "home_id": "Home-ID" }
+        "title": "Home-ID eingeben",
+        "description": "16-stellige Home-ID deines Kontos.\n\n**So findest du sie:** [Hue-Konto-Portal öffnen]({portal}) → anmelden → dein Zuhause anklicken. Die 16 Ziffern stehen in der Adresszeile hinter `/homes/`.\n\nBeispiel: `4618484926709760`",
+        "data": {
+          "home_id": "Home-ID"
+        }
       },
       "camera": {
         "title": "Kamera wählen",
-        "data": { "device_mac": "Kamera" }
+        "data": {
+          "device_mac": "Kamera"
+        }
       }
     },
     "error": {
@@ -21,19 +27,23 @@
       "cannot_connect": "Hue-Cloud nicht erreichbar oder Home-ID falsch.",
       "no_cameras": "Keine Hue Secure Kamera in diesem Home gefunden."
     },
-    "abort": { "already_configured": "Kamera ist bereits eingerichtet." }
+    "abort": {
+      "already_configured": "Kamera ist bereits eingerichtet."
+    }
   },
   "options": {
     "step": {
       "init": {
         "title": "Optionen",
-        "description": "Neuer Login (optional): {url}\nRedirect-URL unten einfügen. E2EE-Passphrase wird derzeit nur gespeichert.",
+        "description": "Neuer Login (optional): {url}\nRedirect-URL unten einfügen. E2EE-Passphrase derzeit nur gespeichert.",
         "data": {
           "callback_url": "Redirect-URL (optional)",
           "e2ee_passphrase": "E2EE-Passphrase"
         }
       }
     },
-    "error": { "auth_failed": "Login fehlgeschlagen." }
+    "error": {
+      "auth_failed": "Login fehlgeschlagen."
+    }
   }
 }

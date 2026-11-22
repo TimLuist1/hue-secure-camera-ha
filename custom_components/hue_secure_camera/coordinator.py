@@ -38,6 +38,7 @@ class HueCameraCoordinator:
         self._client: Optional[HueWebRTCClient] = None
         self._connected = False
         self._entities: set = set()
+        self._listeners: set[asyncio.Queue] = set()
 
     # ── tokens ───────────────────────────────────────────────────────────
 
@@ -86,6 +87,16 @@ class HueCameraCoordinator:
     def _on_frame(self, jpeg: bytes) -> None:
         self._latest_frame = jpeg
         self._last_frame_at = time.monotonic()
+        for queue in list(self._listeners):
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except Exception:
+                    pass
+            try:
+                queue.put_nowait(jpeg)
+            except Exception:
+                pass
         for entity in self._entities:
             entity.async_write_ha_state()
 
@@ -93,6 +104,14 @@ class HueCameraCoordinator:
         self._connected = connected
         for entity in self._entities:
             entity.async_write_ha_state()
+
+    def add_listener(self) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=2)
+        self._listeners.add(queue)
+        return queue
+
+    def remove_listener(self, queue: asyncio.Queue) -> None:
+        self._listeners.discard(queue)
 
     @property
     def latest_frame(self) -> Optional[bytes]:

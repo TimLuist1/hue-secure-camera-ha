@@ -3,14 +3,14 @@
     "step": {
       "auth": {
         "title": "Philips Hue login",
-        "description": "1. Open this link and sign in:\n\n{url}\n\n2. Then copy the full URL from the address bar (starting with https://account.meethue.com/?code=...) and paste it below.",
+        "description": "**Before you start:**\n1. Requires a Hue account with a configured Secure camera.\n2. In the Hue app go to *Settings → Security → Video surveillance* and turn **E2EE / encrypted live view OFF** – otherwise the stream stays encrypted.\n3. Have the **Home ID** (16 digits) ready: sign in at the [Hue account portal]({portal}), open your home, the ID is in the address bar after `/homes/`.\n\n**Login:**\nOpen this link and sign in:\n\n{url}\n\nThen paste the full redirect URL (`https://account.meethue.com/?code=...`) below.",
         "data": {
           "callback_url": "Redirect URL"
         }
       },
       "home": {
-        "title": "Home ID",
-        "description": "16-digit home ID of your Hue account. Example: 4618484926709760",
+        "title": "Enter Home ID",
+        "description": "16-digit home ID of your account.\n\n**How to find it:** [open the Hue account portal]({portal}) → sign in → click your home. The 16 digits are in the address bar after `/homes/`.\n\nExample: `4618484926709760`",
         "data": {
           "home_id": "Home ID"
         }
@@ -24,7 +24,7 @@
     },
     "error": {
       "auth_failed": "Login failed – check the URL and try again.",
-      "cannot_connect": "Hue cloud unreachable or wrong home ID.",
+      "cannot_connect": "Hue cloud unreachable or wrong Home ID.",
       "no_cameras": "No Hue Secure camera found in this home."
     },
     "abort": {

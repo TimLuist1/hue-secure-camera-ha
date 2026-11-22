@@ -34,13 +34,6 @@ class HueSecureCameraConfigFlow(ConfigFlow, domain=DOMAIN):
         self._cameras: list[dict[str, str]] = []
 
     async def async_step_user(self, user_input: Optional[dict[str, Any]] = None) -> FlowResult:
-        if user_input is None:
-            self._verifier = api.make_pkce()[0]
-            return self.async_show_form(
-                step_id="auth",
-                description_placeholders={"url": api.build_auth_url(self._verifier)},
-                data_schema=vol.Schema({vol.Required("callback_url"): str}),
-            )
         return await self.async_step_auth(user_input)
 
     async def async_step_auth(self, user_input: Optional[dict[str, Any]] = None) -> FlowResult:
@@ -63,7 +56,10 @@ class HueSecureCameraConfigFlow(ConfigFlow, domain=DOMAIN):
             self._verifier = api.make_pkce()[0]
         return self.async_show_form(
             step_id="auth",
-            description_placeholders={"url": api.build_auth_url(self._verifier)},
+            description_placeholders={
+                "url": api.build_auth_url(self._verifier),
+                "portal": "https://account.meethue.com/homes",
+            },
             data_schema=vol.Schema({vol.Required("callback_url"): str}),
             errors=errors,
         )
@@ -87,6 +83,7 @@ class HueSecureCameraConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="home",
+            description_placeholders={"portal": "https://account.meethue.com/homes"},
             data_schema=vol.Schema({vol.Required(CONF_HOME_ID, default=self._home_id): str}),
             errors=errors,
         )

@@ -36,21 +36,22 @@ class HueCameraMJPEGView(HomeAssistantView):
             }
         )
         await resp.prepare(request)
-        last = None
+        queue = coordinator.add_listener()
         try:
             while True:
-                frame = await coordinator.async_frame(timeout=4)
-                if frame and frame is not last:
-                    last = frame
-                    await resp.write(
-                        b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                        + str(len(frame)).encode()
-                        + b"\r\n\r\n"
-                        + frame
-                        + b"\r\n"
-                    )
-                else:
-                    await asyncio.sleep(0.1)
+                try:
+                    frame = await asyncio.wait_for(queue.get(), timeout=5)
+                except asyncio.TimeoutError:
+                    continue
+                await resp.write(
+                    b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                    + str(len(frame)).encode()
+                    + b"\r\n\r\n"
+                    + frame
+                    + b"\r\n"
+                )
         except (asyncio.CancelledError, ConnectionResetError):
             pass
+        finally:
+            coordinator.remove_listener(queue)
         return resp

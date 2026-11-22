@@ -1,79 +1,106 @@
-# Philips Hue Secure Camera — Home Assistant Custom Integration
+# Hue Secure Camera — Home Assistant Integration
 
-Live-Bild, Snapshots und MJPEG-Stream von Philips Hue Secure Kameras in Home
-Assistant — **rein serverseitig**, ohne Browser/Chromium und ohne Cloud-Abo.
+![Hue Secure Camera](docs/banner.png)
 
-> Status: experimentell (reverse-engineered), HACS-Installation.
+Live-Bild in 1080p, Snapshots und Vollbild-Stream von Philips Hue Secure
+Kameras in Home Assistant — **rein serverseitig** (kein Browser, kein
+Chromium, kein Cloud-Abo).
+
+[![HACS](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://hacs.xyz)
+![Version](https://img.shields.io/badge/version-0.4.0-blue)
+![HA](https://img.shields.io/badge/Home%20Assistant-2024.6%2B-41BDF5)
+
+> ⚠️ Experimentell, reverse-engineered. Nutzung auf eigene Verantwortung.
+
+![Screenshot](docs/screenshot.jpg)
 
 ---
 
-## Hintergrund
+## Funktionen
 
-Die Kamera überträgt per WebRTC über AWS Kinesis Video Streams, ausschließlich
-verschlüsselt (DTLS/SRTP). Der Kamera-Stack akzeptiert nur SDP-Angebote, die
-dem vollständigen libwebrtc-Format entsprechen. Ein minimales aiortc-Angebot
-führt dazu, dass die Kamera zwar DTLS aufbaut, danach aber stumm bleibt.
-
-Diese Integration nimmt deshalb ein mitgeschnittenes Browser-Angebot als
-Vorlage, ersetzt nur ICE-Credentials, DTLS-Fingerprints und Kandidaten und
-lässt `aiortc` das Medien-Handling übernehmen. Ergebnis: 1080p, ~15 fps,
-stabil mit automatischem Reconnect.
-
-```
-HA (aiortc) ⇄ Hue Cloud/AWS KVS ⇄ Kamera
-        └── H.264/SRTP → JPEG → Entity, MJPEG, Automationen
-```
-
-E2EE (Passphrase) wird gespeichert; die Entschlüsselung ist vorbereitet, aber
-noch nicht getestet – nur nötig, wenn in der Hue-App „Verschlüsselte
-Live-Ansicht“ aktiv ist.
+- Live-Stream (H.264 → HLS/MJPEG) und Vollbild über die normale Kamera-Ansicht
+- Snapshots für Automationen, Benachrichtigungen und Dashboard-Karten
+- Automatischer Reconnect, Watchdog, Kamera-Reboot bei Hänger
+- OAuth2-PKCE-Login, automatische Token-Erneuerung
+- Alles lokal auf dem HA-Server, nur die Hue-Cloud als Signaling
 
 ## Installation (HACS)
 
-1. HACS → Integrationen → ⋮ → Benutzerdefinierte Repositories
+1. HACS → Integrationen → ⋮ → **Benutzerdefinierte Repositories**
 2. `https://github.com/TimLuist1/hue-secure-camera-ha`, Typ `Integration`
 3. Installieren, Home Assistant neu starten
-
-`aiortc` wird beim ersten Start automatisch von HA nachinstalliert.
+4. `aiortc` wird beim ersten Start automatisch nachinstalliert
 
 ## Einrichtung
 
-1. Einstellungen → Geräte & Dienste → Integration hinzufügen →
+1. Einstellungen → Geräte & Dienste → **Integration hinzufügen** →
    „Philips Hue Secure Camera“
-2. Login-Link öffnen, mit dem Hue-Konto anmelden, danach die komplette
-   Redirect-URL (`https://account.meethue.com/?code=...`) einfügen
-3. **Home-ID** eingeben (16-stellig). Beispiel für dieses Konto:
-   `4618484926709760`
+2. Login-Link öffnen, mit dem Hue-Konto anmelden, komplette Redirect-URL
+   (`https://account.meethue.com/?code=...`) einfügen
+3. **Home-ID** (16-stellig) eingeben – Anleitung inkl. Link steht im Dialog
 4. Kamera auswählen
+
+### Home-ID finden
+
+Die Home-ID ist eine **16-stellige Zahl** deines Hue-Kontos (nicht Bridge-ID,
+nicht MAC):
+
+1. [Hue-Konto-Portal](https://account.meethue.com/homes) öffnen und anmelden
+2. Dein Zuhause anklicken
+3. Die 16 Ziffern stehen in der Adresszeile hinter `/homes/`
+
+### ⚠️ Wichtig: E2EE in der Hue-App ausschalten
+
+**Bitte zuerst in der Hue-App unter Einstellungen → Sicherheit →
+Videoüberwachung die E2EE-/Verschlüsselte-Live-Ansicht deaktivieren.**
+Die Entschlüsselung ist vorbereitet, aber noch nicht zuverlässig getestet –
+mit aktivem E2EE bleibt das Bild sonst grün/verrauscht.
 
 ## Nutzung
 
-- Entity: `camera.<name>` – Snapshots über `camera.snapshot` bzw. Dashboard
-- Lovelace-Karte (wird automatisch registriert, MJPEG):
+- **Vollbild:** Kamera öffnen (More-Info) → Player geht auf Vollbild, oder
+  Karte anklicken und ⛶ nutzen
+- **Dashboard-Karte:**
 
 ```yaml
 type: custom:hue-camera-card
 entity: camera.abfahrt_garage
 ```
 
-- MJPEG-URL steht als Attribut `stream_url` an der Entity
-- Der Stream läuft dauerhaft (Start beim Laden der Integration) und reconnectet automatisch – auch nach Kamera-Timeouts
+- **Automation / Snapshot:** `camera.snapshot` bzw.
+  `camera.abfahrt_garage` als `entity_id`
+- MJPEG-URL steht als Attribut `stream_url` bereit
+
+## Roadmap
+
+- [ ] E2EE-Passphrase (Kyber768/ECIES) zuverlässig entschlüsseln
+- [ ] Zwei-Wege-Audio
+- [ ] Sirene / Alarm und Flutlicht steuern
+- [ ] Bewegungssensor (Binary Sensor)
+- [ ] Ereignis-Clips
 
 ## Bekannte Grenzen
 
-- Zwei-Wege-Audio, Sirene, Flutlicht, Bewegungssensor noch nicht umgesetzt
-- E2EE-Entschlüsselung noch nicht aktiv
-- Livebild im HA-Dashboard läuft über MJPEG (kein HLS/WebRTC-Player)
-- Token wird per Refresh-Token erneuert; bei Fehlschlag: Optionen → neuer Login
+- Nur Cloud-Signaling (Kamera ist nicht lokal erreichbar)
+- Ein Stream pro Kamera, kein Mehrfach-Viewer
+- Kein Audio, keine Sirene, kein Flutlicht (siehe Roadmap)
+- Token wird per Refresh-Token verlängert; schlägt das fehl:
+  Optionen → neuer Login
 
 ## Technische Notizen
 
-- OAuth2 PKCE, Client-ID `xOFEN65uPEwp0aMlJ6JA1CK2slFyZtGQ` (aus der Hue-App)
+- OAuth2 PKCE. Die Client-ID `xOFEN65uPEwp0aMlJ6JA1CK2slFyZtGQ` ist die
+  **öffentliche App-Client-ID der Hue-App**, nicht personenbezogen
 - Live-Credentials: `POST /security/vss/v1/home/{home}/credentials/live-stream`
 - KVS-Signaling: SigV4-presigned WSS, `SDP_OFFER/ANSWER`, `ICE_CANDIDATE`
-  (neuere Firmware nutzt das Feld `messageType`)
+  (neuere Firmware: Feld `messageType`)
 - Kamera ist immer DTLS-Client (`a=setup:active`) → Angebot mit `actpass`
-- `tools/local_bridge/` enthält die Mac-Referenzstrecke und aiortc-Experimente
+- **Kritisch:** Die Kamera streamt nur bei einem vollständigen
+  libwebrtc-SDP (Codec-, RTCP-Feedback- und Extmap-Set). Ein minimales
+  aiortc-Angebot führt zu DTLS-Aufbau und danach Stille. Deshalb dient ein
+  mitgeschnittenes Browser-Angebot als Vorlage
+  (`tools/local_bridge/offer_template.sdp`)
+- `tools/local_bridge/` enthält Mac-Referenz und Experimente
 
 ## Debug
 
@@ -82,3 +109,8 @@ logger:
   logs:
     custom_components.hue_secure_camera: debug
 ```
+
+## Lizenz
+
+MIT (Integration). Hue-Firmware/App-Code wurde für Reverse-Engineering
+analysiert.

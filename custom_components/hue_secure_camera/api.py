@@ -151,6 +151,17 @@ async def async_wake(hass: HomeAssistant, token: str, home_id: str, device_id: s
             _LOGGER.debug("wake_up HTTP %d", resp.status)
 
 
+async def async_reboot(hass: HomeAssistant, token: str, home_id: str, device_id: str) -> None:
+    session = async_get_clientsession(hass, verify_ssl=False)
+    async with session.put(
+        HUE_WAKE_URL.format(home_id=home_id, device_id=device_id),
+        headers=_auth(token),
+        json={"action_type": "reboot"},
+    ) as resp:
+        if resp.status not in (200, 202):
+            _LOGGER.debug("reboot HTTP %d", resp.status)
+
+
 async def async_live_stream_creds(
     hass: HomeAssistant, token: str, home_id: str, device_id: str
 ) -> dict[str, Any]:

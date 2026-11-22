@@ -28,7 +28,7 @@ class HueSecureCamera(Camera):
 
     _attr_has_entity_name = True
     _attr_name = None
-    _attr_supported_features = CameraEntityFeature(0)
+    _attr_supported_features = CameraEntityFeature.STREAM
 
     def __init__(self, coordinator: HueCameraCoordinator, entry: ConfigEntry) -> None:
         super().__init__()
@@ -47,6 +47,11 @@ class HueSecureCamera(Camera):
 
     async def async_will_remove_from_hass(self) -> None:
         self._coordinator._entities.discard(self)
+
+    async def stream_source(self) -> Optional[str]:
+        token = self.hass.data.get(DOMAIN, {}).get("token", "")
+        await self._coordinator.async_ensure_stream()
+        return f"http://127.0.0.1:8123/api/hue_secure_camera/stream/{token}/{self._entry_id}"
 
     async def async_camera_image(
         self, width: Optional[int] = None, height: Optional[int] = None

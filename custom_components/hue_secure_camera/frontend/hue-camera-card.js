@@ -17,7 +17,8 @@ class HueCameraCard extends HTMLElement {
       <style>
         :host { display:block; }
         .wrap { position:relative; background:#000; border-radius:12px; overflow:hidden; aspect-ratio:16/9; }
-        img { width:100%; height:100%; object-fit:contain; display:block; }
+        img { width:100%; height:100%; object-fit:contain; display:block; cursor:zoom-in; }
+        .wrap:fullscreen img { object-fit:contain; background:#000; }
         .bar { position:absolute; inset:0 0 auto 0; display:flex; gap:8px; align-items:center;
                padding:6px 10px; font:12px/1.4 system-ui,sans-serif; color:#e8eef5;
                background:linear-gradient(#000000aa,#00000000); }
@@ -25,11 +26,14 @@ class HueCameraCard extends HTMLElement {
         .dot.on { background:#27c46b; box-shadow:0 0 8px #27c46b; }
         .msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
                color:#9fb2c8; font:14px system-ui,sans-serif; }
+        .fs { position:absolute; right:8px; bottom:8px; border:0; border-radius:8px;
+              background:#000000aa; color:#fff; width:34px; height:34px; cursor:pointer; font-size:16px; }
       </style>
       <div class="wrap">
         <img alt="Hue Kamera">
         <div class="bar"><span class="dot"></span><span>Hue Kamera</span></div>
         <div class="msg">verbinde…</div>
+        <button class="fs" title="Vollbild">⛶</button>
       </div>`;
     this._img = this.shadowRoot.querySelector("img");
     this._dot = this.shadowRoot.querySelector(".dot");
@@ -37,6 +41,20 @@ class HueCameraCard extends HTMLElement {
     this._img.addEventListener("load", () => {
       this._dot.classList.add("on");
       this._msg.style.display = "none";
+    });
+    this._img.addEventListener("click", () => {
+      this.dispatchEvent(new CustomEvent("hass-more-info", {
+        detail: { entityId: this._config.entity }, bubbles: true, composed: true,
+      }));
+    });
+    this.shadowRoot.querySelector(".fs").addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const wrap = this.shadowRoot.querySelector(".wrap");
+      if (this.shadowRoot.fullscreenElement || document.fullscreenElement) {
+        document.exitFullscreen?.();
+      } else {
+        (wrap.requestFullscreen ? wrap : this._img).requestFullscreen?.();
+      }
     });
     this._img.addEventListener("error", () => {
       this._dot.classList.remove("on");

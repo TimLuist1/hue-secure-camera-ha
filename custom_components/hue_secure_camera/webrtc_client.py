@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import re
 import time
@@ -39,13 +40,33 @@ if not getattr(_RTCDtlsTransport, "_hue_tolerant", False):
     _orig_recv_next = _RTCDtlsTransport._recv_next
 
     async def _recv_next_tolerant(self) -> None:
+        # After the DTLS shutdown the SRTP keys stay valid: keep reading and
+        # routing RTP without touching OpenSSL again.
+        if getattr(self, "_hue_dtls_closed", False):
+            data = await self.transport._recv()
+            first = data[0]
+            if 127 < first < 192 and self._rx_srtp:
+                from aiortc.rtp import is_rtcp
+                from aiortc import clock
+
+                try:
+                    if is_rtcp(data):
+                        await self._handle_rtcp_data(self._rx_srtp.unprotect_rtcp(data))
+                    else:
+                        await self._handle_rtp_data(
+                            self._rx_srtp.unprotect(data), arrival_time_ms=clock.current_ms()
+                        )
+                except Exception:
+                    pass
+            return
+
         try:
             await _orig_recv_next(self)
         except ConnectionError:
             if getattr(self, "_rx_srtp", None) is None:
                 raise
-            _LOGGER.debug("DTLS close_notify ignored (SRTP active)")
-            await asyncio.sleep(0.01)
+            self._hue_dtls_closed = True  # type: ignore[attr-defined]
+            _LOGGER.debug("DTLS closed, switching to SRTP-only receive")
 
     _RTCDtlsTransport._recv_next = _recv_next_tolerant  # type: ignore[assignment]
     _RTCDtlsTransport._hue_tolerant = True  # type: ignore[attr-defined]
@@ -70,10 +91,10 @@ a=extmap:6/recvonly http://www.webrtc.org/experiments/rtp-hdrext/playout-delay
 a=extmap:7 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01
 a=extmap:8 urn:3gpp:video-orientation
 a=extmap:9/recvonly https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension
-a=fmtp:126 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1
-a=fmtp:97 profile-level-id=42e01f;level-asymmetry-allowed=1
-a=fmtp:105 profile-level-id=42001f;level-asymmetry-allowed=1;packetization-mode=1
-a=fmtp:103 profile-level-id=42001f;level-asymmetry-allowed=1
+a=fmtp:126 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1;max-fs=12288;max-fr=30
+a=fmtp:97 profile-level-id=42e01f;level-asymmetry-allowed=1;max-fs=12288;max-fr=30
+a=fmtp:105 profile-level-id=42001f;level-asymmetry-allowed=1;packetization-mode=1;max-fs=12288;max-fr=30
+a=fmtp:103 profile-level-id=42001f;level-asymmetry-allowed=1;max-fs=12288;max-fr=30
 a=fmtp:99 profile=0;level-idx=9;tier=0
 a=fmtp:120 max-fs=12288;max-fr=60
 a=fmtp:124 apt=120
@@ -179,6 +200,13 @@ a=rtpmap:101 telephone-event/8000
 a=setup:actpass"""
 
 
+def _encode_jpeg(frame) -> bytes:
+    image = frame.to_image()
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=60)
+    return buf.getvalue()
+
+
 class HueWebRTCClient:
     """Maintains one camera session in the background."""
 
@@ -207,6 +235,10 @@ class HueWebRTCClient:
         self._last_frame = 0.0
         self._connected_at = 0.0
         self._got_frames = False
+        self._pending_frame = None
+        self._pumping = False
+        self._enc_ms = 0.0
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hue_jpeg")
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -217,6 +249,7 @@ class HueWebRTCClient:
         self._task = self.hass.async_create_background_task(
             self._run(), f"hue stream {self._device_mac}"
         )
+        self._enc_task = asyncio.ensure_future(self._encoder_loop())
 
     async def stop(self) -> None:
         self._running = False
@@ -232,6 +265,9 @@ class HueWebRTCClient:
             except Exception:
                 pass
             self._ws = None
+        if getattr(self, "_enc_task", None):
+            self._enc_task.cancel()
+            self._enc_task = None
         if self._task:
             self._task.cancel()
             self._task = None
@@ -251,6 +287,7 @@ class HueWebRTCClient:
 
     async def _run(self) -> None:
         delay = 2.0
+        failures = 0
         while self._running:
             self._got_frames = False
             try:
@@ -259,13 +296,28 @@ class HueWebRTCClient:
                 return
             except Exception as exc:
                 _LOGGER.debug("Hue stream error: %s", exc)
+                if getattr(exc, "status", None) == 400:
+                    delay = max(delay, 45)
             if not self._running:
                 return
             if self._got_frames:
                 # session was healthy – reconnect quickly
                 delay = 0.5
+                failures = 0
             else:
+                failures += 1
                 delay = min(delay * 2, 20)
+                if failures == 4:
+                    _LOGGER.warning("Camera stuck, rebooting it")
+                    try:
+                        await api.async_reboot(
+                            self.hass, await self._token_provider(),
+                            self._home_id, self._device_mac,
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(45)
+                    failures = 0
             await asyncio.sleep(delay)
 
     # ── single session ───────────────────────────────────────────────────
@@ -302,6 +354,8 @@ class HueWebRTCClient:
         for stun in creds.get("stun_servers", []):
             ice_servers.append(RTCIceServer(urls=stun))
 
+        self._pumping = False
+        self._pending_frame = None
         pc = RTCPeerConnection(
             RTCConfiguration(iceServers=ice_servers, bundlePolicy=RTCBundlePolicy.MAX_BUNDLE)
         )
@@ -320,7 +374,8 @@ class HueWebRTCClient:
 
         @pc.on("track")
         async def on_track(track) -> None:
-            if track.kind == "video":
+            if track.kind == "video" and not self._pumping:
+                self._pumping = True
                 await self._pump(track)
 
         endpoint = await api.async_signaling_endpoint(self.hass, arn, region, kvs)
@@ -482,13 +537,52 @@ class HueWebRTCClient:
 
     # ── media ────────────────────────────────────────────────────────────
 
+    async def _encoder_loop(self) -> None:
+        last_count = 0
+        last_t = time.monotonic()
+        loop = asyncio.get_running_loop()
+        while self._running:
+            frame = self._pending_frame
+            if frame is None:
+                await asyncio.sleep(0.005)
+                continue
+            self._pending_frame = None
+            try:
+                if frame.width > 960:
+                    frame = frame.reformat(
+                        width=960, height=round(frame.height * 960 / frame.width),
+                        format="rgb24",
+                    )
+                _t0 = time.monotonic()
+                jpeg = await loop.run_in_executor(self._executor, _encode_jpeg, frame)
+                self._enc_ms += (time.monotonic() - _t0) * 1000
+                self._last_frame = time.monotonic()
+                self._got_frames = True
+                last_count += 1
+                self._on_frame(jpeg)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                _LOGGER.debug("JPEG encode failed: %s", exc)
+            now = time.monotonic()
+            if last_count >= 50 and now - last_t >= 1:
+                _LOGGER.debug("fps=%.1f enc=%.0fms", last_count / (now - last_t),
+                              self._enc_ms / max(last_count, 1))
+                self._enc_ms = 0.0
+                last_count = 0
+                last_t = now
+
     async def _pump(self, track) -> None:
         async def pli_loop() -> None:
             remote = self._pc.remoteDescription.sdp if self._pc and self._pc.remoteDescription else ""
             match = re.search(r"a=ssrc:(\d+)", remote)
             media_ssrc = int(match.group(1)) if match else 0
+            started = time.monotonic()
             while self._running:
-                await asyncio.sleep(3)
+                await asyncio.sleep(1)
+                stale = self._last_frame and time.monotonic() - self._last_frame > 2
+                if time.monotonic() - started > 10 and not stale:
+                    continue
                 for receiver in self._pc.getReceivers() if self._pc else []:
                     try:
                         await receiver._send_rtcp(
@@ -510,17 +604,11 @@ class HueWebRTCClient:
                     continue
                 except Exception:
                     break
-                self._last_frame = time.monotonic()
+                self._pending_frame = frame
                 self._got_frames = True
-                try:
-                    image = frame.to_image()
-                    buf = io.BytesIO()
-                    image.save(buf, format="JPEG", quality=72)
-                    self._on_frame(buf.getvalue())
-                except Exception as exc:
-                    _LOGGER.debug("JPEG encode failed: %s", exc)
         finally:
             pli.cancel()
+            self._pumping = False
 
     # ── SDP ──────────────────────────────────────────────────────────────
 
