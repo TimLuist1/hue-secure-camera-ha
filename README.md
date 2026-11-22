@@ -34,6 +34,10 @@ Chromium, kein Cloud-Abo).
 
 ## Einrichtung
 
+[![Open your Home Assistant instance and start setting up this integration.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=hue_secure_camera)
+
+Oder manuell:
+
 1. Einstellungen → Geräte & Dienste → **Integration hinzufügen** →
    „Philips Hue Secure Camera“
 2. Login-Link öffnen, mit dem Hue-Konto anmelden, komplette Redirect-URL
