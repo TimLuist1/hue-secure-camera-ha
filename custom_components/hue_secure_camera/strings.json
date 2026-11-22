@@ -1,63 +1,39 @@
 {
   "config": {
     "step": {
-      "user": {
-        "title": "Philips Hue — Login",
-        "description": "**Schritt 1:** Öffne diesen Link in deinem Browser und melde dich mit deinem Philips Hue Konto an:\n\n[Philips Hue Login öffnen]({auth_url})\n\n**Schritt 2:** Nach dem Login wirst du zu `account.meethue.com` weitergeleitet. Kopiere die vollständige URL aus der Adressleiste (sie enthält `?code=...`) und füge sie unten ein.",
-        "data": {
-          "callback_url": "URL aus der Adressleiste nach dem Login"
-        }
+      "auth": {
+        "title": "Philips Hue Login",
+        "description": "1. Öffne diesen Link und melde dich an:\n\n{url}\n\n2. Kopiere danach die komplette URL aus der Adresszeile (beginnend mit https://account.meethue.com/?code=...) und füge sie unten ein.",
+        "data": { "callback_url": "Redirect-URL" }
       },
       "home": {
-        "title": "Hue Home auswählen",
-        "data": { "home_id": "Hue Home" }
-      },
-      "manual_home": {
-        "title": "Home-ID eingeben",
-        "description": "{hint}",
-        "data": { "home_id": "Home-ID (14-stellige Zahl)" }
+        "title": "Home-ID",
+        "description": "16-stellige Home-ID deines Hue-Kontos. Beispiel: 4618484926709760",
+        "data": { "home_id": "Home-ID" }
       },
       "camera": {
         "title": "Kamera wählen",
-        "data": {
-          "device_mac": "Kamera",
-          "device_name": "Anzeigename (optional)"
-        }
-      },
-      "e2ee": {
-        "title": "E2EE-Passphrase",
-        "description": "{info}",
-        "data": { "e2ee_passphrase": "E2EE-Passphrase (leer = keine)" }
+        "data": { "device_mac": "Kamera" }
       }
     },
     "error": {
-      "no_code": "Keine Anmelde-Code in der URL gefunden. Hast du die vollständige URL aus der Adressleiste kopiert?",
-      "state_mismatch": "Sicherheitsfehler: State stimmt nicht überein. Bitte erneut versuchen.",
-      "token_exchange_failed": "Login fehlgeschlagen. Bitte erneut versuchen.",
-      "no_cameras": "Keine Kameras in diesem Home gefunden."
+      "auth_failed": "Login fehlgeschlagen – URL prüfen und erneut versuchen.",
+      "cannot_connect": "Hue-Cloud nicht erreichbar oder Home-ID falsch.",
+      "no_cameras": "Keine Hue Secure Kamera in diesem Home gefunden."
     },
-    "abort": {
-      "already_configured": "Diese Kamera ist bereits eingerichtet."
-    }
+    "abort": { "already_configured": "Kamera ist bereits eingerichtet." }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Einstellungen",
+        "title": "Optionen",
+        "description": "Neuer Login (optional): {url}\nRedirect-URL unten einfügen. E2EE-Passphrase wird derzeit nur gespeichert.",
         "data": {
-          "action": "Aktion",
+          "callback_url": "Redirect-URL (optional)",
           "e2ee_passphrase": "E2EE-Passphrase"
         }
-      },
-      "relogin": {
-        "title": "Neu einloggen",
-        "description": "**Schritt 1:** Öffne diesen Link und melde dich an:\n\n[Philips Hue Login]({auth_url})\n\n**Schritt 2:** Kopiere die URL aus der Adressleiste nach dem Login.",
-        "data": { "callback_url": "URL aus der Adressleiste nach dem Login" }
       }
     },
-    "error": {
-      "no_code": "Kein Code in der URL gefunden.",
-      "token_exchange_failed": "Login fehlgeschlagen."
-    }
+    "error": { "auth_failed": "Login fehlgeschlagen." }
   }
 }

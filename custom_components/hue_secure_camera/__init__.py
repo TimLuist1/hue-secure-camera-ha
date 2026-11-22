@@ -1,43 +1,48 @@
-"""Philips Hue Secure Camera — HA integration entry point."""
+"""Philips Hue Secure Camera integration for Home Assistant."""
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
+from homeassistant.components.frontend import add_extra_js_url
+from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
 from .coordinator import HueCameraCoordinator
+from .signal import async_register_websocket
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = ["camera"]
+CARD_URL = "/hue_secure_camera/hue-camera-card.js"
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    hass.data.setdefault(DOMAIN, {})
+    async_register_websocket(hass)
+
+    card_path = Path(__file__).parent / "frontend" / "hue-camera-card.js"
+    await hass.http.async_register_static_paths(
+        [StaticPathConfig(CARD_URL, str(card_path), cache_headers=False)]
+    )
+    add_extra_js_url(hass, CARD_URL)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up integration from a config entry."""
-    hass.data.setdefault(DOMAIN, {})
-
-    coordinator = HueCameraCoordinator(hass, entry.data)
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    coordinator = HueCameraCoordinator(hass, entry.entry_id, dict(entry.data))
+    coordinator.async_start_refresh_loop()
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    # Listen for option updates (new token / passphrase)
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
-
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
-    coordinator: HueCameraCoordinator = hass.data[DOMAIN].pop(entry.entry_id, None)
-    if coordinator:
-        await coordinator.stop_stream()
-
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-
-
-async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle options update (reload to apply new token / passphrase)."""
-    await hass.config_entries.async_reload(entry.entry_id)
+    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unloaded:
+        coordinator: HueCameraCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
+        coordinator.async_stop()
+    return unloaded

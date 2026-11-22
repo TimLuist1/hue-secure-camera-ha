@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Hue Kamera Live</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#0b0d10; color:#e8eef5; font:14px/1.4 -apple-system,system-ui,sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:10px 14px; background:#12161c; border-bottom:1px solid #222a35; }
+  header b { font-weight:600; }
+  #dot { width:10px; height:10px; border-radius:50%; background:#666; }
+  #dot.live { background:#27c46b; box-shadow:0 0 8px #27c46b; }
+  #fps { font-variant-numeric:tabular-nums; color:#8fb3d9; }
+  main { position:relative; }
+  video { width:100vw; max-height:calc(100vh - 66px); object-fit:contain; background:#000; display:block; }
+  #overlay { position:absolute; inset:0; pointer-events:none; display:flex; align-items:center; justify-content:center;
+             color:#9fb2c8; font-size:18px; text-align:center; white-space:pre-line; }
+  footer { padding:8px 14px; font:11px/1.5 ui-monospace,monospace; color:#7d8a99; max-height:20vh; overflow:auto; border-top:1px solid #222a35; }
+</style>
+</head>
+<body>
+<header>
+  <span id="dot"></span><b>Hue Secure Camera</b>
+  <span id="state">verbinde…</span>
+  <span style="margin-left:auto"></span>
+  <span id="fps">0 fps</span>
+</header>
+<main>
+  <video id="v" autoplay muted playsinline></video>
+  <div id="overlay">warte auf Kamera…</div>
+</main>
+<footer id="log"></footer>
+<canvas id="c" hidden></canvas>
+<script>
+const logEl = document.getElementById('log');
+const stateEl = document.getElementById('state');
+const dot = document.getElementById('dot');
+const video = document.getElementById('v');
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: false });
+let pc = null, dc = null, ws = null, frames = 0, lastFps = performance.now(), pump = null;
+let reconnecting = false, paused = false, lastFrameAt = 0, lastPost = 0, connectedAt = 0, gotFrame = false;
+
+function log(...a) {
+  const line = new Date().toLocaleTimeString() + ' ' + a.join(' ');
+  logEl.textContent += line + '\n';
+  logEl.scrollTop = logEl.scrollHeight; console.log(line);
+}
+function setState(s, live) { stateEl.textContent = s; dot.classList.toggle('live', !!live); }
+
+function reconnect(reason) {
+  if (reconnecting || paused) return;
+  reconnecting = true;
+  setState('neu verbinden…');
+  log('RECONNECT:', reason);
+  try { if (dc) dc.close(); } catch (e) {}
+  try { if (pc) pc.close(); } catch (e) {}
+  pc = null; dc = null; gotFrame = false; connectedAt = 0; lastFrameAt = 0;
+  try { if (ws) { ws.onclose = null; ws.close(); } } catch (e) {}
+  ws = null;
+  setTimeout(() => { reconnecting = false; connect(); }, 2500);
+}
+function connect() {
+  paused = false;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => log('signal verbunden');
+  ws.onclose = () => { setState('signal getrennt'); log('signal closed'); reconnect('ws closed'); };
+  ws.onerror = () => log('signal error');
+  ws.onmessage = async (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.type === 'busy') {
+      paused = true; setState('anderer Tab aktiv'); log('busy – warte');
+      try { ws.onclose = null; ws.close(); } catch (e) {}
+      setTimeout(() => { paused = false; connect(); }, 5000);
+      return;
+    }
+    if (m.type === 'config') return start(m.iceServers);
+    if (!pc) return;
+    if (m.type === 'offer' && !pc.remoteDescription) {
+      log('unerwartetes camera-offer');
+      await pc.setRemoteDescription({ type: 'offer', sdp: m.sdp });
+      const a = await pc.createAnswer(); await pc.setLocalDescription(a);
+      ws.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription.sdp }));
+    } else if (m.type === 'answer') {
+      log('answer von kamera empfangen');
+      await pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });
+    } else if (m.type === 'ice') {
+      try { await pc.addIceCandidate({ candidate: m.candidate, sdpMid: m.sdpMid ?? '0', sdpMLineIndex: m.sdpMLineIndex ?? 0 }); }
+      catch (e) { log('ice err', e.message); }
+    } else if (m.type === 'error') { log('SERVER FEHLER:', m.message); setState('Fehler'); }
+  };
+}
+
+async function start(iceServers) {
+  pc = new RTCPeerConnection({ iceServers, bundlePolicy: 'max-bundle' });
+  pc.onicecandidate = (e) => {
+    if (e.candidate && ws.readyState === 1)
+      ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate.candidate,
+        sdpMid: e.candidate.sdpMid, sdpMLineIndex: e.candidate.sdpMLineIndex }));
+  };
+  pc.onconnectionstatechange = () => {
+    log('pc', pc.connectionState);
+    if (pc.connectionState === 'connected') connectedAt = Date.now();
+    setState(pc.connectionState, pc.connectionState === 'connected');
+    if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) reconnect('pc ' + pc.connectionState);
+  };
+  pc.oniceconnectionstatechange = () => log('ice', pc.iceConnectionState);
+  pc.ontrack = (e) => {
+    log('track', e.track.kind);
+    if (e.track.kind === 'video') {
+      video.srcObject = e.streams[0] || new MediaStream([e.track]);
+      document.getElementById('overlay').textContent = '';
+      video.requestVideoFrameCallback?.(countFrame);
+    }
+  };
+  // We are the offerer, so create the data channel ourselves.
+  dc = pc.createDataChannel('hue-camera', { ordered: true });
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+  dc.onopen = () => { log('DC OPEN → sende {"streaming":true}'); dc.send('{"streaming":true}'); };
+  dc.onclose = () => log('DC closed');
+  dc.onerror = (e) => log('DC error', e.message || '');
+  dc.onmessage = (e) => log('DC msg:', typeof e.data === 'string' ? e.data : '<bin ' + e.data.byteLength + '>');
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  log('offer erstellt, sende…');
+  ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }));
+}
+
+let lastStats = 0;
+async function sendStats() {
+  if (!pc) return;
+  const stats = await pc.getStats();
+  const out = {}; out.dc = dc ? dc.readyState : 'none';
+  stats.forEach(s => {
+    if (s.type === 'inbound-rtp' && s.kind === 'video') {
+      out.fps = s.framesPerSecond; out.w = s.frameWidth; out.h = s.frameHeight;
+      out.bytes = s.bytesReceived; out.lost = s.packetsLost;
+      out.jitter = s.jitter; out.freeze = s.freezeCount;
+    }
+    if (s.type === 'candidate-pair' && s.state === 'succeeded') {
+      out.rtt = s.currentRoundTripTime; out.avail = s.availableIncomingBitrate;
+    }
+  });
+  fetch('/stats', { method: 'POST', body: JSON.stringify({ t: Date.now(), ...out }) });
+}
+function countFrame() {
+  lastFrameAt = Date.now(); if (!gotFrame) { gotFrame = true; log('erste Frames'); }
+  frames++;
+  const now = performance.now();
+  if (now - lastFps >= 1000) {
+    document.getElementById('fps').textContent = Math.round(frames * 1000 / (now - lastFps)) + ' fps';
+    frames = 0; lastFps = now;
+  }
+  if (now - lastStats >= 2000) { lastStats = now; sendStats(); }
+  if (now - lastPost >= 100) { lastPost = now; postFrame(); }
+  video.requestVideoFrameCallback(countFrame);
+}
+function postFrame() {
+  if (video.readyState < 2 || !video.videoWidth) return;
+  canvas.width = 1280;
+  canvas.height = Math.round(1280 * video.videoHeight / video.videoWidth) || 720;
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  canvas.toBlob((b) => { if (b) fetch('/frame', { method: 'POST', body: b }).catch(() => {}); }, 'image/jpeg', 0.72);
+}
+setInterval(() => {
+  if (!pc || pc.connectionState !== 'connected') return;
+  const now = Date.now();
+  const limit = gotFrame ? 12000 : 35000;
+  const base = gotFrame ? lastFrameAt : connectedAt;
+  if (base && now - base > limit) reconnect('watchdog: keine Frames');
+}, 2500);
+connect();
+</script>
+</body>
+</html>
