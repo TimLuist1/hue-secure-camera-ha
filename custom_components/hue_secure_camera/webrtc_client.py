@@ -1,716 +1,454 @@
-"""WebRTC client for Philips Hue Secure Camera via AWS KVS.
+"""Native WebRTC client for Hue Secure cameras (aiortc, no browser).
 
-Contains all reverse-engineered patches:
-  1. RTCBundlePolicy.MAX_BUNDLE  – single ICE transport → DTLS on correct queue
-  2. DTLS close_notify patch     – camera sends TLS alert immediately after handshake
-  3. SRTP frame counter          – log STUN / DTLS / SRTP per-packet counts
-  4. FrameCryptor (E2EE)         – decrypt RTP payload using derived AES-GCM key
-  5. SDP fingerprint matching    – use actual camera SSRCs from SDP answer
+The camera only streams when the offer looks like a browser offer: it needs the
+full codec/feedback/extension set of libwebrtc. We therefore take a captured
+browser offer as template and only swap ICE credentials, DTLS fingerprints and
+candidates. Media is decoded by aiortc and delivered as JPEG frames.
 """
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
-import json
+import io
 import logging
 import re
-import struct
 import time
-import urllib.parse
-from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import aiohttp
 from aiortc import (
-    MediaStreamTrack,
     RTCConfiguration,
-    RTCIceCandidate,
     RTCIceServer,
     RTCPeerConnection,
     RTCSessionDescription,
 )
-from aiortc.rtcdtls import RTCDtlsTransport
-from aiortc.rtp import RtpPacket
 from aiortc.rtcpeerconnection import RTCBundlePolicy
+from aiortc.rtp import RtcpPsfbPacket, RTCP_PSFB_PLI
 
-import av
-
-from .e2ee import E2EEKeyResult, apply_frame_key_to_rtp
+from . import api, signal
 
 _LOGGER = logging.getLogger(__name__)
 
-# ─── AWS / KVS helpers ────────────────────────────────────────────────────────
-
-def _sigv4_sign(
-    method: str,
-    url: str,
-    payload: bytes,
-    region: str,
-    access_key: str,
-    secret_key: str,
-    session_token: str,
-    service: str = "kinesisvideo",
-) -> dict[str, str]:
-    """Create AWS SigV4 authorization headers."""
-    import datetime
-
-    now = datetime.datetime.utcnow()
-    date_str = now.strftime("%Y%m%d")
-    datetime_str = now.strftime("%Y%m%dT%H%M%SZ")
-
-    parsed = urllib.parse.urlparse(url)
-    host = parsed.netloc
-    path = parsed.path or "/"
-    query = parsed.query
-
-    headers_to_sign = {
-        "content-type": "application/json",
-        "host": host,
-        "x-amz-date": datetime_str,
-        "x-amz-security-token": session_token,
-    }
-    signed_headers = ";".join(sorted(headers_to_sign))
-
-    def _sha256(data: bytes) -> str:
-        return hashlib.sha256(data).hexdigest()
-
-    def _hmac_sha256(key: bytes, msg: str) -> bytes:
-        import hmac as _hmac
-
-        return _hmac.new(key, msg.encode(), hashlib.sha256).digest()
-
-    canonical_headers = "".join(
-        f"{k}:{v}\n" for k, v in sorted(headers_to_sign.items())
-    )
-    canonical_request = "\n".join(
-        [method, path, query, canonical_headers, signed_headers, _sha256(payload)]
-    )
-    credential_scope = f"{date_str}/{region}/{service}/aws4_request"
-    string_to_sign = "\n".join(
-        ["AWS4-HMAC-SHA256", datetime_str, credential_scope, _sha256(canonical_request.encode())]
-    )
-
-    signing_key = _hmac_sha256(
-        _hmac_sha256(
-            _hmac_sha256(
-                _hmac_sha256(
-                    f"AWS4{secret_key}".encode(), date_str
-                ),
-                region,
-            ),
-            service,
-        ),
-        "aws4_request",
-    )
-    import hmac as _hmac
-
-    signature = _hmac.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
-
-    auth_header = (
-        f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
-        f"SignedHeaders={signed_headers}, Signature={signature}"
-    )
-
-    return {
-        "Authorization": auth_header,
-        "Content-Type": "application/json",
-        "Host": host,
-        "x-amz-date": datetime_str,
-        "x-amz-security-token": session_token,
-    }
-
-
-async def _kvs_get_signaling_endpoint(
-    channel_arn: str, region: str, creds: dict
-) -> str:
-    """Get the WSS endpoint for a KVS signaling channel."""
-    url = f"https://kinesisvideo.{region}.amazonaws.com/getSignalingChannelEndpoint"
-    payload = json.dumps(
-        {"ChannelARN": channel_arn, "SingleMasterChannelEndpointConfiguration": {"Protocols": ["WSS"], "Role": "VIEWER"}}
-    ).encode()
-    headers = _sigv4_sign(
-        "POST",
-        url,
-        payload,
-        region,
-        creds["AccessKeyId"],
-        creds["SecretAccessKey"],
-        creds["SessionToken"],
-    )
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, data=payload, ssl=False) as resp:
-            data = await resp.json()
-            endpoints = data.get("ResourceEndpointList", [])
-            for ep in endpoints:
-                if ep.get("Protocol") == "WSS":
-                    return ep["ResourceEndpoint"]
-    raise RuntimeError("No WSS endpoint returned from KVS")
-
-
-def _build_wss_url(wss_endpoint: str, channel_arn: str, client_id: str, region: str, creds: dict) -> str:
-    """Build pre-signed WSS URL for KVS signaling."""
-    import datetime
-    import hmac
-
-    now = datetime.datetime.utcnow()
-    date_str = now.strftime("%Y%m%d")
-    datetime_str = now.strftime("%Y%m%dT%H%M%SZ")
-
-    parsed = urllib.parse.urlparse(wss_endpoint)
-    host = parsed.netloc
-    path = "/?"
-    params = urllib.parse.urlencode(
-        {
-            "X-Amz-ChannelARN": channel_arn,
-            "X-Amz-ClientId": client_id,
-        }
-    )
-    query = params
-
-    access_key = creds["AccessKeyId"]
-    secret_key = creds["SecretAccessKey"]
-    session_token = creds["SessionToken"]
-
-    credential_scope = f"{date_str}/{region}/kinesisvideo/aws4_request"
-    amz_credential = urllib.parse.quote_plus(f"{access_key}/{credential_scope}")
-
-    canonical_query = (
-        f"X-Amz-Algorithm=AWS4-HMAC-SHA256"
-        f"&X-Amz-ChannelARN={urllib.parse.quote_plus(channel_arn)}"
-        f"&X-Amz-ClientId={urllib.parse.quote_plus(client_id)}"
-        f"&X-Amz-Credential={amz_credential}"
-        f"&X-Amz-Date={datetime_str}"
-        f"&X-Amz-Expires=299"
-        f"&X-Amz-Security-Token={urllib.parse.quote_plus(session_token)}"
-        f"&X-Amz-SignedHeaders=host"
-    )
-
-    canonical_request = "\n".join(
-        ["GET", "/", canonical_query, f"host:{host}\n", "host", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"]
-    )
-    string_to_sign = "\n".join(
-        ["AWS4-HMAC-SHA256", datetime_str, credential_scope, hashlib.sha256(canonical_request.encode()).hexdigest()]
-    )
-
-    def _h(key: bytes, msg: str) -> bytes:
-        return hmac.new(key, msg.encode(), hashlib.sha256).digest()
-
-    signing_key = _h(_h(_h(_h(f"AWS4{secret_key}".encode(), date_str), region), "kinesisvideo"), "aws4_request")
-    signature = hmac.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
-
-    signed_url = (
-        f"{wss_endpoint}/?{canonical_query}&X-Amz-Signature={signature}"
-    )
-    return signed_url
-
-
-# ─── Packet type classifier ───────────────────────────────────────────────────
-
-def _pkt_type(data: bytes) -> str:
-    if not data:
-        return "EMPTY"
-    b = data[0]
-    if b == 0 or b == 1:
-        return "STUN"
-    if 20 <= b <= 63:
-        return "DTLS"
-    if 128 <= b <= 191:
-        return "SRTP"
-    return "OTHER"
-
-
-# ─── DTLS close_notify patch ──────────────────────────────────────────────────
-
-_original_recv_next = None
-
-
-def _patch_dtls_close_notify():
-    """Patch RTCDtlsTransport to ignore TLS close_notify alerts.
-
-    The Hue camera sends a DTLS close_notify immediately after completing
-    the handshake. Without this patch aiortc closes the connection.
-    """
-    global _original_recv_next
-
-    if _original_recv_next is not None:
-        return  # already patched
-
-    _original_recv_next = RTCDtlsTransport._recv_next
-
-    async def _patched_recv_next(self):
-        try:
-            return await _original_recv_next(self)
-        except ConnectionError as exc:
-            # Camera sends close_notify right after handshake; ignore if SRTP is up
-            if self._rx_srtp is not None:
-                _LOGGER.debug("DTLS close_notify ignored (SRTP already established)")
-                return
-            raise
-
-    RTCDtlsTransport._recv_next = _patched_recv_next
-    _LOGGER.debug("DTLS close_notify patch applied")
-
-
-# ─── Main WebRTC client ───────────────────────────────────────────────────────
-
-@dataclass
-class StreamFrame:
-    """A decoded video frame from the camera."""
-    pts: int
-    dts: int
-    width: int
-    height: int
-    jpeg: bytes  # JPEG-encoded snapshot
+OFFER_TEMPLATE = """v=0
+o=hue-ha 0 1 IN IP4 0.0.0.0
+s=-
+t=0 0
+a=sendrecv
+a=extmap-allow-mixed
+a=fingerprint:sha-256 {{FP256}}
+a=group:BUNDLE 0 1
+a=ice-options:trickle
+a=msid-semantic:WMS *
+m=video 9 UDP/TLS/RTP/SAVPF 120 124 121 125 126 127 97 98 105 106 103 104 99 100 123 122 119
+c=IN IP4 0.0.0.0
+a=recvonly
+a=extmap:3 urn:ietf:params:rtp-hdrext:sdes:mid
+a=extmap:4 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time
+a=extmap:5 urn:ietf:params:rtp-hdrext:toffset
+a=extmap:6/recvonly http://www.webrtc.org/experiments/rtp-hdrext/playout-delay
+a=extmap:7 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01
+a=extmap:8 urn:3gpp:video-orientation
+a=extmap:9/recvonly https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension
+a=fmtp:126 profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1
+a=fmtp:97 profile-level-id=42e01f;level-asymmetry-allowed=1
+a=fmtp:105 profile-level-id=42001f;level-asymmetry-allowed=1;packetization-mode=1
+a=fmtp:103 profile-level-id=42001f;level-asymmetry-allowed=1
+a=fmtp:99 profile=0;level-idx=9;tier=0
+a=fmtp:120 max-fs=12288;max-fr=60
+a=fmtp:124 apt=120
+a=fmtp:121 max-fs=12288;max-fr=60
+a=fmtp:125 apt=121
+a=fmtp:127 apt=126
+a=fmtp:98 apt=97
+a=fmtp:106 apt=105
+a=fmtp:104 apt=103
+a=fmtp:100 apt=99
+a=fmtp:119 apt=122
+a=ice-pwd:{{PWD}}
+a=ice-ufrag:{{UF}}
+a=mid:0
+a=rtcp-fb:120 nack
+a=rtcp-fb:120 nack pli
+a=rtcp-fb:120 ccm fir
+a=rtcp-fb:120 goog-remb
+a=rtcp-fb:120 transport-cc
+a=rtcp-fb:121 nack
+a=rtcp-fb:121 nack pli
+a=rtcp-fb:121 ccm fir
+a=rtcp-fb:121 goog-remb
+a=rtcp-fb:121 transport-cc
+a=rtcp-fb:126 nack
+a=rtcp-fb:126 nack pli
+a=rtcp-fb:126 ccm fir
+a=rtcp-fb:126 goog-remb
+a=rtcp-fb:126 transport-cc
+a=rtcp-fb:97 nack
+a=rtcp-fb:97 nack pli
+a=rtcp-fb:97 ccm fir
+a=rtcp-fb:97 goog-remb
+a=rtcp-fb:97 transport-cc
+a=rtcp-fb:105 nack
+a=rtcp-fb:105 nack pli
+a=rtcp-fb:105 ccm fir
+a=rtcp-fb:105 goog-remb
+a=rtcp-fb:105 transport-cc
+a=rtcp-fb:103 nack
+a=rtcp-fb:103 nack pli
+a=rtcp-fb:103 ccm fir
+a=rtcp-fb:103 goog-remb
+a=rtcp-fb:103 transport-cc
+a=rtcp-fb:99 nack
+a=rtcp-fb:99 nack pli
+a=rtcp-fb:99 ccm fir
+a=rtcp-fb:99 goog-remb
+a=rtcp-fb:99 transport-cc
+a=rtcp-fb:123 nack
+a=rtcp-fb:123 nack pli
+a=rtcp-fb:123 ccm fir
+a=rtcp-fb:123 goog-remb
+a=rtcp-fb:123 transport-cc
+a=rtcp-fb:122 nack
+a=rtcp-fb:122 nack pli
+a=rtcp-fb:122 ccm fir
+a=rtcp-fb:122 goog-remb
+a=rtcp-fb:122 transport-cc
+a=rtcp-mux
+a=rtcp-rsize
+a=rtpmap:120 VP8/90000
+a=rtpmap:124 rtx/90000
+a=rtpmap:121 VP9/90000
+a=rtpmap:125 rtx/90000
+a=rtpmap:126 H264/90000
+a=rtpmap:127 rtx/90000
+a=rtpmap:97 H264/90000
+a=rtpmap:98 rtx/90000
+a=rtpmap:105 H264/90000
+a=rtpmap:106 rtx/90000
+a=rtpmap:103 H264/90000
+a=rtpmap:104 rtx/90000
+a=rtpmap:99 AV1/90000
+a=rtpmap:100 rtx/90000
+a=rtpmap:123 ulpfec/90000
+a=rtpmap:122 red/90000
+a=rtpmap:119 rtx/90000
+a=setup:actpass
+m=audio 0 UDP/TLS/RTP/SAVPF 109 9 0 8 101
+c=IN IP4 0.0.0.0
+a=bundle-only
+a=recvonly
+a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level
+a=extmap:2/recvonly urn:ietf:params:rtp-hdrext:csrc-audio-level
+a=extmap:3 urn:ietf:params:rtp-hdrext:sdes:mid
+a=extmap:7 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01
+a=fmtp:109 maxplaybackrate=48000;stereo=1;useinbandfec=1
+a=fmtp:101 0-15
+a=ice-pwd:{{PWD}}
+a=ice-ufrag:{{UF}}
+a=mid:1
+a=rtcp-fb:109 transport-cc
+a=rtcp-fb:9 transport-cc
+a=rtcp-fb:0 transport-cc
+a=rtcp-fb:8 transport-cc
+a=rtcp-mux
+a=rtpmap:109 opus/48000/2
+a=rtpmap:9 G722/8000/1
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=setup:actpass"""
 
 
 class HueWebRTCClient:
-    """Manages a WebRTC connection to a Hue Secure Camera via AWS KVS.
-
-    Usage:
-        client = HueWebRTCClient(config, e2ee_key=key_result)
-        await client.start()
-        ...
-        frame = await client.get_frame()
-        ...
-        await client.stop()
-    """
+    """Maintains one camera session in the background."""
 
     def __init__(
         self,
+        hass,
+        token_provider: Callable[[], Awaitable[str]],
         home_id: str,
         device_mac: str,
-        channel_arn: str,
-        aws_region: str,
-        hue_bearer: str,
-        kvs_credentials: dict,         # {AccessKeyId, SecretAccessKey, SessionToken}
-        ice_servers: list[dict],        # [{urls:…, username:…, credential:…}]
-        e2ee_key: Optional[E2EEKeyResult] = None,
-        on_frame: Optional[Callable[[StreamFrame], None]] = None,
+        on_frame: Callable[[bytes], None],
+        on_connected: Callable[[bool], None],
     ) -> None:
-        self.home_id = home_id
-        self.device_mac = device_mac
-        self.channel_arn = channel_arn
-        self.aws_region = aws_region
-        self.hue_bearer = hue_bearer
-        self.kvs_credentials = kvs_credentials
-        self.ice_servers = ice_servers
-        self.e2ee_key = e2ee_key
-        self.on_frame = on_frame
-
-        self._pc: Optional[RTCPeerConnection] = None
-        self._task: Optional[asyncio.Task] = None
+        self.hass = hass
+        self._token_provider = token_provider
+        self._home_id = home_id
+        self._device_mac = device_mac
+        self._on_frame = on_frame
+        self._on_connected = on_connected
         self._running = False
-        self._frame_queue: asyncio.Queue[StreamFrame] = asyncio.Queue(maxsize=30)
-        self._connected = asyncio.Event()
-        self._stopped = asyncio.Event()
+        self._task: Optional[asyncio.Task] = None
+        self._pc: Optional[RTCPeerConnection] = None
+        self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self._last_frame = 0.0
 
-        # Stats
-        self._stats = {"stun": 0, "dtls": 0, "srtp": 0, "other": 0, "frames": 0}
-        self._last_stats_log = 0.0
-
-        _patch_dtls_close_notify()
-
-    # ── Public interface ──────────────────────────────────────────────────
+    # ── lifecycle ────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Start the WebRTC connection in the background."""
+        if self._running:
+            return
         self._running = True
-        self._task = asyncio.ensure_future(self._run())
+        self._task = self.hass.async_create_background_task(
+            self._run(), f"hue stream {self._device_mac}"
+        )
 
     async def stop(self) -> None:
-        """Stop the WebRTC connection."""
         self._running = False
         if self._pc:
-            await self._pc.close()
+            try:
+                await self._pc.close()
+            except Exception:
+                pass
+            self._pc = None
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
         if self._task:
             self._task.cancel()
+            self._task = None
+        self._on_connected(False)
+
+    @property
+    def is_alive(self) -> bool:
+        return self._running and time.monotonic() - self._last_frame < 10
+
+    async def restart(self) -> None:
+        """Force the current session to end; the run loop reconnects."""
+        if self._ws:
             try:
-                await self._task
-            except asyncio.CancelledError:
+                await self._ws.close()
+            except Exception:
                 pass
-        self._stopped.set()
-
-    async def wait_connected(self, timeout: float = 30.0) -> bool:
-        """Wait until ICE+DTLS are connected. Returns True on success."""
-        try:
-            await asyncio.wait_for(self._connected.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            return False
-
-    async def get_frame(self, timeout: float = 5.0) -> Optional[StreamFrame]:
-        """Get the next decoded video frame."""
-        try:
-            return await asyncio.wait_for(self._frame_queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return None
-
-    @property
-    def is_connected(self) -> bool:
-        return self._connected.is_set()
-
-    @property
-    def stats(self) -> dict:
-        return dict(self._stats)
-
-    # ── Internal WebRTC flow ──────────────────────────────────────────────
 
     async def _run(self) -> None:
-        """Full lifecycle: wake → credentials → WebRTC → receive frames."""
-        retry_delay = 5
+        delay = 3
         while self._running:
             try:
                 await self._connect_once()
+                delay = 3
             except asyncio.CancelledError:
-                break
+                return
             except Exception as exc:
-                _LOGGER.warning("WebRTC connection failed: %s; retrying in %ds", exc, retry_delay)
-                self._connected.clear()
-                await asyncio.sleep(retry_delay)
-                retry_delay = min(retry_delay * 2, 60)
+                _LOGGER.debug("Hue stream error: %s", exc)
+            if self._running:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30)
+
+    # ── single session ───────────────────────────────────────────────────
 
     async def _connect_once(self) -> None:
-        """Single connection attempt."""
-        # 1. Wake camera
-        await self._wake_camera()
-
-        # 2. Get live-stream credentials (fresh each time)
-        creds = await self._get_live_stream_creds()
-        if not creds:
-            raise RuntimeError("Failed to get live-stream credentials")
-
-        kvs_creds = creds.get("awsCredentials", creds.get("credentials", {}))
-        channel_arn = creds.get("channelArn", self.channel_arn)
-        region = creds.get("region", self.aws_region)
-
-        # Parse TURN/STUN servers
-        ice_servers = self._parse_ice_servers(creds)
-
-        # Parse E2EE KeyEnvelope if present
-        b64_envelope = creds.get("base64KeyEnvelope", "")
-        salt = base64.b64decode(creds.get("e2eeSalt", "") + "==") if creds.get("e2eeSalt") else b""
-
-        # 3. Build RTCPeerConnection with MAX_BUNDLE
-        ice_server_objects = [
-            RTCIceServer(
-                urls=s.get("urls", s.get("url", "")),
-                username=s.get("username"),
-                credential=s.get("credential"),
-            )
-            for s in ice_servers
-        ]
-        config = RTCConfiguration(
-            iceServers=ice_server_objects,
-            bundlePolicy=RTCBundlePolicy.MAX_BUNDLE,
+        token = await self._token_provider()
+        creds = await api.async_live_stream_creds(
+            self.hass, token, self._home_id, self._device_mac
         )
-        pc = RTCPeerConnection(configuration=config)
+
+        raw = creds.get("credentials") or creds.get("awsCredentials") or {}
+        kvs = {
+            "AccessKeyId": raw.get("AccessKeyId", ""),
+            "SecretAccessKey": raw.get("SecretAccessKey", ""),
+            "SessionToken": raw.get("SessionToken", ""),
+        }
+        arn = creds.get("channelArn") or creds["signaling_channels"][0]["arn"]
+        region = arn.split(":")[3] if arn.count(":") >= 3 else "eu-west-1"
+
+        ice_servers: list[RTCIceServer] = []
+        for entry in creds.get("turn_servers", []):
+            for srv in entry.get("ice_servers", []):
+                urls = srv.get("urls") or []
+                if isinstance(urls, str):
+                    urls = [urls]
+                urls = [u.split("?")[0] for u in urls if "transport=tcp" in u] or urls
+                ice_servers.append(
+                    RTCIceServer(
+                        urls=urls,
+                        username=srv.get("username"),
+                        credential=srv.get("password"),
+                    )
+                )
+        for stun in creds.get("stun_servers", []):
+            ice_servers.append(RTCIceServer(urls=stun))
+
+        pc = RTCPeerConnection(
+            RTCConfiguration(iceServers=ice_servers, bundlePolicy=RTCBundlePolicy.MAX_BUNDLE)
+        )
         self._pc = pc
+        pc.addTransceiver("video", direction="recvonly")
+        pc.addTransceiver("audio", direction="recvonly")
 
-        # 4. Patch datagram_received for packet stats
-        self._patch_stun_protocol(pc)
-
-        # 5. Set up track handler
-        codec = None
+        offer = await pc.createOffer()
+        sdp = self._build_offer(offer.sdp)
+        await pc.setLocalDescription(RTCSessionDescription(sdp=sdp, type="offer"))
 
         @pc.on("track")
-        async def on_track(track: MediaStreamTrack):
-            nonlocal codec
-            _LOGGER.info("Track received: kind=%s", track.kind)
+        async def on_track(track) -> None:
             if track.kind == "video":
-                asyncio.ensure_future(self._receive_video(track))
+                await self._pump(track)
 
-        @pc.on("connectionstatechange")
-        async def on_connection_state():
-            state = pc.connectionState
-            _LOGGER.info("WebRTC connectionState → %s", state)
-            if state == "connected":
-                self._connected.set()
-            elif state in ("failed", "closed"):
-                self._connected.clear()
+        endpoint = await api.async_signaling_endpoint(self.hass, arn, region, kvs)
+        client_id = f"HA-{self._device_mac}-{int(time.time())}"
+        url = api.presign_wss(
+            endpoint, arn, client_id, region,
+            kvs["AccessKeyId"], kvs["SecretAccessKey"], kvs["SessionToken"],
+        )
+        from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-        @pc.on("iceconnectionstatechange")
-        async def on_ice_state():
-            _LOGGER.debug("ICE state → %s", pc.iceConnectionState)
+        session = async_get_clientsession(self.hass, verify_ssl=False)
+        ws = await session.ws_connect(url, headers={"User-Agent": "HomeAssistant/HueCamera"})
+        self._ws = ws
 
-        # 6. KVS signaling
-        wss_endpoint = await _kvs_get_signaling_endpoint(channel_arn, region, kvs_creds)
-        client_id = f"HA-{self.device_mac}-{int(time.time())}"
-        wss_url = _build_wss_url(wss_endpoint, channel_arn, client_id, region, kvs_creds)
+        await api.async_wake(self.hass, token, self._home_id, self._device_mac)
 
-        import websockets
+        answered = asyncio.Event()
+        remote_id = ""
+        offer_sent = False
 
-        _LOGGER.debug("Connecting to KVS WSS: %s", wss_endpoint)
+        async def send_offer() -> None:
+            nonlocal offer_sent
+            await ws.send_str(signal.encode_kvs("SDP_OFFER", {"sdp": sdp, "type": "offer"}))
+            offer_sent = True
 
-        async with websockets.connect(wss_url, additional_headers={"User-Agent": "HomeAssistant/HueCamera"}) as ws:
-            # Receive SDP offer from camera
-            sdp_offer = await self._recv_sdp_offer(ws)
-            if not sdp_offer:
-                raise RuntimeError("No SDP offer received from camera")
-
-            # Set remote description
-            await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp_offer["sdp"], type=sdp_offer["type"]))
-
-            # Create and set local answer
-            answer = await pc.createAnswer()
-            await pc.setLocalDescription(answer)
-
-            # Send answer
-            msg = {
-                "action": "SDP_ANSWER",
-                "messagePayload": base64.b64encode(
-                    json.dumps({"sdp": pc.localDescription.sdp, "type": "answer"}).encode()
-                ).decode(),
-                "recipientClientId": sdp_offer.get("senderClientId", ""),
-            }
-            await ws.send(json.dumps(msg))
-            _LOGGER.debug("SDP answer sent")
-
-            # Exchange ICE candidates
-            await self._exchange_ice(ws, pc, sdp_offer.get("senderClientId", ""))
-
-        # Wait for connection or timeout
-        if not await self.wait_connected(timeout=30):
-            raise RuntimeError("WebRTC connection timed out")
-
-        # Keep alive until stopped
-        await self._keepalive_loop()
-
-    async def _recv_sdp_offer(self, ws) -> Optional[dict]:
-        """Wait for SDP_OFFER message from camera."""
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                msg = json.loads(raw)
-                action = msg.get("action", "")
-                payload_b64 = msg.get("messagePayload", "")
-                if not payload_b64:
-                    continue
-                payload = json.loads(base64.b64decode(payload_b64 + "=="))
-                if action == "SDP_OFFER" or payload.get("type") == "offer":
-                    _LOGGER.debug("SDP offer received (len=%d)", len(payload.get("sdp", "")))
-                    payload["senderClientId"] = msg.get("senderClientId", "")
-                    return payload
-                if action == "ICE_CANDIDATE":
-                    candidate_data = payload.get("candidate", "")
-                    if candidate_data:
-                        await self._add_ice_candidate(self._pc, candidate_data, payload)
-            except asyncio.TimeoutError:
-                continue
-            except Exception as exc:
-                _LOGGER.debug("WS recv error: %s", exc)
-                break
-        return None
-
-    async def _exchange_ice(self, ws, pc: RTCPeerConnection, remote_id: str) -> None:
-        """Exchange ICE candidates over the signaling channel."""
-
-        async def _send_local_ice():
-            while True:
-                candidate = await pc.sctp.transport.ice._gather_candidates()
-                if candidate is None:
-                    break
-                msg = {
-                    "action": "ICE_CANDIDATE",
-                    "messagePayload": base64.b64encode(
-                        json.dumps(
-                            {
-                                "candidate": candidate.to_sdp(),
-                                "sdpMid": "0",
-                                "sdpMLineIndex": 0,
-                            }
-                        ).encode()
-                    ).decode(),
-                    "recipientClientId": remote_id,
-                }
-                await ws.send(json.dumps(msg))
-
-        # Receive remote ICE candidates for up to 10 seconds
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
-                msg = json.loads(raw)
-                if msg.get("action") == "ICE_CANDIDATE":
-                    payload = json.loads(base64.b64decode(msg.get("messagePayload", "") + "=="))
-                    await self._add_ice_candidate(pc, payload.get("candidate", ""), payload)
-            except asyncio.TimeoutError:
-                break
-            except Exception:
-                break
-
-    @staticmethod
-    async def _add_ice_candidate(pc: RTCPeerConnection, candidate_str: str, payload: dict) -> None:
-        try:
-            from aiortc.sdp import candidate_from_sdp
-
-            cand = candidate_from_sdp(candidate_str.replace("candidate:", ""))
-            cand.sdpMid = payload.get("sdpMid", "0")
-            cand.sdpMLineIndex = payload.get("sdpMLineIndex", 0)
-            await pc.addIceCandidate(cand)
-        except Exception as exc:
-            _LOGGER.debug("addIceCandidate failed: %s", exc)
-
-    async def _receive_video(self, track: MediaStreamTrack) -> None:
-        """Receive and decode video frames from the track."""
-        _LOGGER.info("Video receive loop started")
-        codec = av.CodecContext.create("h264", "r")
-
-        while self._running:
-            try:
-                packet = await asyncio.wait_for(track.recv(), timeout=5.0)
-            except asyncio.TimeoutError:
-                continue
-            except Exception as exc:
-                _LOGGER.debug("track.recv error: %s", exc)
-                break
-
-            self._stats["frames"] += 1
-
-            # Apply FrameCryptor E2EE decryption if key available
-            if self.e2ee_key and hasattr(packet, "data"):
-                packet_data = apply_frame_key_to_rtp(bytes(packet.data), self.e2ee_key.frame_key)
-            else:
-                packet_data = bytes(packet.data) if hasattr(packet, "data") else None
-
-            if packet_data and self.on_frame:
+        async def keep_offering() -> None:
+            while self._running and not answered.is_set():
                 try:
-                    av_pkt = av.Packet(packet_data)
-                    frames = codec.decode(av_pkt)
-                    for frame in frames:
-                        jpeg = frame.to_ndarray(format="rgb24")
-                        # Convert to JPEG
-                        img_frame = av.VideoFrame.from_ndarray(jpeg, format="rgb24")
-                        jpeg_bytes = img_frame.to_image().tobytes()
-                        sf = StreamFrame(
-                            pts=packet.pts or 0,
-                            dts=packet.dts or 0,
-                            width=frame.width,
-                            height=frame.height,
-                            jpeg=jpeg_bytes,
+                    if offer_sent:
+                        await api.async_wake(
+                            self.hass, token, self._home_id, self._device_mac
                         )
-                        self.on_frame(sf)
-                        if not self._frame_queue.full():
-                            self._frame_queue.put_nowait(sf)
-                except Exception as exc:
-                    _LOGGER.debug("frame decode error: %s", exc)
+                        await send_offer()
+                    await asyncio.wait_for(answered.wait(), 8)
+                    if answered.is_set():
+                        break
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    pass
 
-            # Log stats every 30 seconds
-            now = time.time()
-            if now - self._last_stats_log >= 30:
-                _LOGGER.info(
-                    "Stats[%s]: STUN=%d DTLS=%d SRTP=%d OTHER=%d frames=%d",
-                    self.device_mac,
-                    self._stats["stun"],
-                    self._stats["dtls"],
-                    self._stats["srtp"],
-                    self._stats["other"],
-                    self._stats["frames"],
+        async def send_candidates() -> None:
+            for _ in range(50):
+                if pc.iceGatheringState == "complete":
+                    break
+                await asyncio.sleep(0.2)
+            local = pc.localDescription.sdp if pc.localDescription else ""
+            cands = list(
+                dict.fromkeys(
+                    line[2:] for line in local.splitlines() if line.startswith("a=candidate:")
                 )
-                self._last_stats_log = now
+            )
+            for cand in cands:
+                await ws.send_str(
+                    signal.encode_kvs(
+                        "ICE_CANDIDATE",
+                        {"candidate": cand, "sdpMid": "0", "sdpMLineIndex": 0},
+                    )
+                )
 
-    async def _keepalive_loop(self) -> None:
-        """Keep the connection alive via STUN keep-alives (handled by aiortc)."""
-        while self._running and self._pc and self._pc.connectionState == "connected":
-            await asyncio.sleep(25)
+        async def frame_watchdog() -> None:
+            while not ws.closed:
+                await asyncio.sleep(5)
+                if self._last_frame and time.monotonic() - self._last_frame > 20:
+                    _LOGGER.debug("No frames for 20s, reconnecting")
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    return
 
-    # ── Hue API calls ─────────────────────────────────────────────────────
-
-    async def _wake_camera(self) -> None:
-        url = (
-            f"https://api.account.meethue.com/security/device-configuration/v1"
-            f"/home/{self.home_id}/device/{self.device_mac}/command"
-        )
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.put(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {self.hue_bearer}",
-                        "Content-Type": "application/json",
-                    },
-                    json={"action_type": "wake_up"},
-                    ssl=False,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    _LOGGER.debug("wake_up → %d", resp.status)
-            await asyncio.sleep(1.5)
-        except Exception as exc:
-            _LOGGER.warning("wake_camera failed: %s", exc)
+            await send_offer()
+            asyncio.ensure_future(send_candidates())
+            asyncio.ensure_future(keep_offering())
+            asyncio.ensure_future(frame_watchdog())
 
-    async def _get_live_stream_creds(self) -> Optional[dict]:
-        url = (
-            f"https://api.account.meethue.com/security/vss/v1"
-            f"/home/{self.home_id}/credentials/live-stream?turn_servers=true"
-        )
+            async for msg in ws:
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    continue
+                action, payload, sender = signal.decode_kvs(msg.data)
+                if action == "SDP_ANSWER" or payload.get("type") == "answer":
+                    if answered.is_set():
+                        continue
+                    remote_id = sender or remote_id
+                    answered.set()
+                    await pc.setRemoteDescription(
+                        RTCSessionDescription(sdp=payload["sdp"], type="answer")
+                    )
+                    self._on_connected(True)
+                elif action == "ICE_CANDIDATE" and payload.get("candidate"):
+                    cand = payload["candidate"]
+                    try:
+                        from aiortc.sdp import candidate_from_sdp
+
+                        c = candidate_from_sdp(cand.replace("candidate:", ""))
+                        c.sdpMid = payload.get("sdpMid", "0")
+                        c.sdpMLineIndex = payload.get("sdpMLineIndex", 0)
+                        await pc.addIceCandidate(c)
+                    except Exception:
+                        pass
+        finally:
+            self._on_connected(False)
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            self._ws = None
+            try:
+                await pc.close()
+            except Exception:
+                pass
+            self._pc = None
+
+    # ── media ────────────────────────────────────────────────────────────
+
+    async def _pump(self, track) -> None:
+        async def pli_loop() -> None:
+            remote = self._pc.remoteDescription.sdp if self._pc and self._pc.remoteDescription else ""
+            match = re.search(r"a=ssrc:(\d+)", remote)
+            media_ssrc = int(match.group(1)) if match else 0
+            while self._running:
+                await asyncio.sleep(3)
+                for receiver in self._pc.getReceivers() if self._pc else []:
+                    try:
+                        await receiver._send_rtcp(
+                            RtcpPsfbPacket(
+                                fmt=RTCP_PSFB_PLI,
+                                ssrc=receiver._RTCRtpReceiver__rtcp_ssrc,
+                                media_ssrc=media_ssrc,
+                            )
+                        )
+                    except Exception:
+                        pass
+
+        pli = asyncio.ensure_future(pli_loop())
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {self.hue_bearer}",
-                        "Content-Type": "application/json",
-                    },
-                    json={"device_id_list": [self.device_mac]},
-                    ssl=False,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    _LOGGER.warning("live-stream creds HTTP %d", resp.status)
-        except Exception as exc:
-            _LOGGER.error("live-stream creds error: %s", exc)
-        return None
+            while self._running:
+                try:
+                    frame = await asyncio.wait_for(track.recv(), timeout=15)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    break
+                self._last_frame = time.monotonic()
+                try:
+                    image = frame.to_image()
+                    buf = io.BytesIO()
+                    image.save(buf, format="JPEG", quality=72)
+                    self._on_frame(buf.getvalue())
+                except Exception as exc:
+                    _LOGGER.debug("JPEG encode failed: %s", exc)
+        finally:
+            pli.cancel()
+
+    # ── SDP ──────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _parse_ice_servers(creds: dict) -> list[dict]:
-        servers = []
-        # Look for TURN/STUN in common response shapes
-        for key in ("iceServers", "ice_servers", "turnServers", "turn_servers"):
-            val = creds.get(key)
-            if isinstance(val, list):
-                servers.extend(val)
-            elif isinstance(val, dict):
-                servers.append(val)
-        if not servers:
-            servers.append({"urls": "stun:stun.l.google.com:19302"})
-        return servers
-
-    # ── Packet stats patch ────────────────────────────────────────────────
-
-    def _patch_stun_protocol(self, pc: RTCPeerConnection) -> None:
-        """Patch the internal STUN protocol to count received packet types."""
-        stats = self._stats
-
-        try:
-            from aioice.stun import parse_message as _orig_parse  # noqa: F401
-            from aiortc.rtcicetransport import RTCIceTransport
-
-            original_datagram = None
-            for transport in getattr(pc._iceTransports, "__dict__", {}).values():
-                pass  # just ensure import works
-        except Exception:
-            return
-
-        # Monkey-patch the underlying asyncio protocol
-        try:
-            ice = pc._iceTransports[0]._connection if pc._iceTransports else None
-        except Exception:
-            ice = None
-
-        if ice is None:
-            return
-
-        proto = getattr(ice, "_protocol", None)
-        if proto is None:
-            return
-
-        original_datagram_received = proto.datagram_received
-
-        def patched_datagram_received(data, addr):
-            t = _pkt_type(data)
-            stats[t.lower() if t.lower() in stats else "other"] += 1
-            return original_datagram_received(data, addr)
-
-        proto.datagram_received = patched_datagram_received
+    def _build_offer(aiortc_sdp: str) -> str:
+        ufrag = re.search(r"a=ice-ufrag:(\S+)", aiortc_sdp).group(1)
+        pwd = re.search(r"a=ice-pwd:(\S+)", aiortc_sdp).group(1)
+        fps = dict(re.findall(r"a=fingerprint:(sha-\d+) (\S+)", aiortc_sdp))
+        sdp = OFFER_TEMPLATE
+        sdp = sdp.replace("{{UF}}", ufrag).replace("{{PWD}}", pwd)
+        sdp = sdp.replace("{{FP256}}", fps.get("sha-256", ""))
+        sdp = sdp.replace("{{FP384}}", fps.get("sha-384", ""))
+        sdp = sdp.replace("{{FP512}}", fps.get("sha-512", ""))
+        return sdp

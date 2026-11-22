@@ -42,14 +42,24 @@ class HueSecureCamera(Camera):
             model="Hue Secure Camera",
         )
 
+    async def async_added_to_hass(self) -> None:
+        self._coordinator._entities.add(self)
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._coordinator._entities.discard(self)
+
     async def async_camera_image(
         self, width: Optional[int] = None, height: Optional[int] = None
     ) -> Optional[bytes]:
-        return self._coordinator.latest_frame
+        return await self._coordinator.async_frame()
 
     @property
     def extra_state_attributes(self) -> dict:
-        return {"entry_id": self._entry_id}
+        token = self.hass.data.get(DOMAIN, {}).get("token", "")
+        return {
+            "entry_id": self._entry_id,
+            "stream_url": f"/api/hue_secure_camera/stream/{token}/{self._entry_id}",
+        }
 
     @property
     def is_streaming(self) -> bool:

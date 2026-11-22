@@ -241,26 +241,36 @@ def presign_wss(
     endpoint: str, channel_arn: str, client_id: str, region: str,
     ak: str, sk: str, st: str,
 ) -> str:
-    """Presign the KVS WebSocket URL (query-string SigV4)."""
+    """Presign the KVS WebSocket URL (SigV4, query string)."""
     now = datetime.datetime.utcnow()
     date_str = now.strftime("%Y%m%d")
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
-    url = f"{endpoint}?X-Amz-ChannelARN={urllib.parse.quote(channel_arn, safe='')}&X-Amz-ClientId={urllib.parse.quote(client_id, safe='')}"
-    parsed = urllib.parse.urlparse(url)
-    query = urllib.parse.parse_qsl(parsed.query)
-    query.append(("X-Amz-Algorithm", "AWS4-HMAC-SHA256"))
-    query.append(("X-Amz-Credential", f"{ak}/{date_str}/{region}/kinesisvideo/aws4_request"))
-    query.append(("X-Amz-Date", stamp))
-    query.append(("X-Amz-Expires", "299"))
-    query.append(("X-Amz-Security-Token", st))
-    query.append(("X-Amz-SignedHeaders", "host"))
-    query.sort()
-    canonical_query = urllib.parse.urlencode(query, quote_via=urllib.parse.quote)
-    canonical = "\n".join(
-        ["GET", parsed.path or "/", canonical_query, f"host:{parsed.netloc}\n", "host", "UNSIGNED-PAYLOAD"]
-    )
+    host = urllib.parse.urlparse(endpoint).netloc
     scope = f"{date_str}/{region}/kinesisvideo/aws4_request"
-    to_sign = "\n".join(["AWS4-HMAC-SHA256", stamp, scope, _sha256(canonical.encode())])
+
+    canonical_query = (
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        f"&X-Amz-ChannelARN={urllib.parse.quote_plus(channel_arn)}"
+        f"&X-Amz-ClientId={urllib.parse.quote_plus(client_id)}"
+        f"&X-Amz-Credential={urllib.parse.quote_plus(f'{ak}/{scope}')}"
+        f"&X-Amz-Date={stamp}"
+        "&X-Amz-Expires=299"
+        f"&X-Amz-Security-Token={urllib.parse.quote_plus(st)}"
+        "&X-Amz-SignedHeaders=host"
+    )
+    canonical = "\n".join(
+        [
+            "GET",
+            "/",
+            canonical_query,
+            f"host:{host}\n",
+            "host",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ]
+    )
+    to_sign = "\n".join(
+        ["AWS4-HMAC-SHA256", stamp, scope, _sha256(canonical.encode())]
+    )
     key = _hmac(_hmac(_hmac(_hmac(f"AWS4{sk}".encode(), date_str), region), "kinesisvideo"), "aws4_request")
     signature = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
-    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{canonical_query}&X-Amz-Signature={signature}"
+    return f"{endpoint}/?{canonical_query}&X-Amz-Signature={signature}"

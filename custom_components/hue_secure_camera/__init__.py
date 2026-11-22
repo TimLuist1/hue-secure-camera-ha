@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import secrets
 from pathlib import Path
 
 from homeassistant.components.frontend import add_extra_js_url
@@ -11,6 +12,7 @@ from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
 from .coordinator import HueCameraCoordinator
+from .http_view import HueCameraMJPEGView
 from .signal import async_register_websocket
 
 _LOGGER = logging.getLogger(__name__)
@@ -21,7 +23,9 @@ CARD_URL = "/hue_secure_camera/hue-camera-card.js"
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN].setdefault("token", secrets.token_urlsafe(24))
     async_register_websocket(hass)
+    hass.http.register_view(HueCameraMJPEGView())
 
     card_path = Path(__file__).parent / "frontend" / "hue-camera-card.js"
     await hass.http.async_register_static_paths(
