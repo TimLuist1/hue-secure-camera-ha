@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from homeassistant.components.camera import Camera, CameraEntityFeature
+from homeassistant.components.camera import Camera, CameraEntityFeature, StreamType
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
@@ -65,6 +65,10 @@ class HueSecureCamera(Camera):
             "entry_id": self._entry_id,
             "stream_url": f"/api/hue_secure_camera/stream/{token}/{self._entry_id}",
         }
+
+    @property
+    def frontend_stream_type(self) -> StreamType:
+        return StreamType.HLS
 
     @property
     def is_streaming(self) -> bool:

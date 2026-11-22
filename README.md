@@ -13,7 +13,6 @@ Chromium, kein Cloud-Abo).
 
 > ⚠️ Experimentell, reverse-engineered. Nutzung auf eigene Verantwortung.
 
-![Screenshot](docs/screenshot.jpg)
 
 ---
 
