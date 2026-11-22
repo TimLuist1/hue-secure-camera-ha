@@ -12,6 +12,9 @@ Chromium, kein Cloud-Abo).
 ![HA](https://img.shields.io/badge/Home%20Assistant-2024.6%2B-41BDF5)
 
 > ⚠️ Experimentell, reverse-engineered. Nutzung auf eigene Verantwortung.
+>
+> **Kein Bearer-Token / mitmproxy nötig** – der Login läuft per OAuth-Button
+> direkt im Einrichtungsdialog. Alte Anleitungen mit `mitmproxy` sind veraltet.
 
 
 ---
