@@ -17,6 +17,7 @@ from homeassistant.components.camera.webrtc import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from webrtc_models import RTCConfiguration, RTCIceCandidateInit, RTCIceServer
 
 from . import api, signal
 
@@ -43,25 +44,19 @@ class HueWebRTCBridge:
             self.hass, token, self.coordinator.home_id, self.coordinator.device_mac
         )
         self._creds = creds
-        servers = []
+        servers: list[RTCIceServer] = []
         for entry in creds.get("turn_servers", []):
             for srv in entry.get("ice_servers", []):
                 servers.append(
-                    {
-                        "urls": srv.get("urls"),
-                        "username": srv.get("username"),
-                        "credential": srv.get("password"),
-                    }
+                    RTCIceServer(
+                        urls=srv.get("urls"),
+                        username=srv.get("username"),
+                        credential=srv.get("password"),
+                    )
                 )
         for stun in creds.get("stun_servers", []):
-            servers.append({"urls": stun})
-        self._ice_servers = servers
-        return WebRTCClientConfiguration(
-            configuration={
-                "iceServers": servers,
-                "bundlePolicy": "max-bundle",
-            }
-        )
+            servers.append(RTCIceServer(urls=stun))
+        return WebRTCClientConfiguration(configuration=RTCConfiguration(ice_servers=servers))
 
     async def async_start(self, offer_sdp: str, send_message: WebRTCSendMessage) -> None:
         self._send = send_message
@@ -104,15 +99,18 @@ class HueWebRTCBridge:
                     self._remote_id = sender or self._remote_id
                     if self._send:
                         self._send(WebRTCAnswer(payload.get("sdp", "")))
+                    await self._flush_candidates()
                 elif action == "ICE_CANDIDATE":
                     if self._send and payload.get("candidate"):
                         self._send(
                             WebRTCCandidate(
-                                {
-                                    "candidate": payload["candidate"],
-                                    "sdpMid": payload.get("sdpMid", "0"),
-                                    "sdpMLineIndex": payload.get("sdpMLineIndex", 0),
-                                }
+                                RTCIceCandidateInit.from_dict(
+                                    {
+                                        "candidate": payload["candidate"],
+                                        "sdpMid": payload.get("sdpMid", "0"),
+                                        "sdpMLineIndex": payload.get("sdpMLineIndex", 0),
+                                    }
+                                )
                             )
                         )
         except Exception as exc:
@@ -123,7 +121,7 @@ class HueWebRTCBridge:
 
     async def async_add_candidate(self, candidate: dict[str, Any]) -> None:
         self._pending_candidates.append(candidate)
-        if self._ws:
+        if self._ws and self._remote_id:
             await self._flush_candidates()
 
     async def _flush_candidates(self) -> None:

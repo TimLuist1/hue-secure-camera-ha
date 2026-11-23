@@ -38,6 +38,7 @@ class HueCameraCoordinator:
         self._client: Optional[HueWebRTCClient] = None
         self._connected = False
         self._entities: set = set()
+        self.ice_servers: list[dict] = []
         self._listeners: set[asyncio.Queue] = set()
 
     # ── tokens ───────────────────────────────────────────────────────────
@@ -100,6 +101,9 @@ class HueCameraCoordinator:
         for entity in self._entities:
             entity.async_write_ha_state()
 
+    def _set_ice_servers(self, servers: list[dict]) -> None:
+        self.ice_servers = servers
+
     def _on_connected(self, connected: bool) -> None:
         self._connected = connected
         for entity in self._entities:
@@ -138,6 +142,7 @@ class HueCameraCoordinator:
                 self.device_mac,
                 self._on_frame,
                 self._on_connected,
+                self._set_ice_servers,
             )
         if not self._client._running:
             await self._client.start()

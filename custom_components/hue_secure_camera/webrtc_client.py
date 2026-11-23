@@ -218,6 +218,7 @@ class HueWebRTCClient:
         device_mac: str,
         on_frame: Callable[[bytes], None],
         on_connected: Callable[[bool], None],
+        on_ice_servers: Callable[[list], None],
         passphrase: str = "",
     ) -> None:
         self.hass = hass
@@ -226,6 +227,7 @@ class HueWebRTCClient:
         self._device_mac = device_mac
         self._on_frame = on_frame
         self._on_connected = on_connected
+        self._on_ice_servers = on_ice_servers
         self._passphrase = passphrase
         self._frame_key: Optional[bytes] = None
         self._running = False
@@ -353,6 +355,15 @@ class HueWebRTCClient:
                 )
         for stun in creds.get("stun_servers", []):
             ice_servers.append(RTCIceServer(urls=stun))
+        try:
+            self._on_ice_servers(
+                [
+                    {"urls": s.urls, "username": s.username, "credential": s.credential}
+                    for s in ice_servers
+                ]
+            )
+        except Exception:
+            pass
 
         self._pumping = False
         self._pending_frame = None

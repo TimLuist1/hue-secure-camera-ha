@@ -68,9 +68,20 @@ class HueSecureCamera(Camera):
             "stream_url": f"/api/hue_secure_camera/stream/{token}/{self._entry_id}",
         }
 
-    async def async_get_webrtc_client_configuration(self):
-        self._bridge = HueWebRTCBridge(self.hass, self._coordinator)
-        return await self._bridge.async_prepare()
+    def async_get_webrtc_client_configuration(self):
+        from webrtc_models import RTCConfiguration, RTCIceServer
+
+        servers = [
+            RTCIceServer(
+                urls=srv.get("urls"),
+                username=srv.get("username"),
+                credential=srv.get("credential"),
+            )
+            for srv in self._coordinator.ice_servers
+        ]
+        from homeassistant.components.camera.webrtc import WebRTCClientConfiguration
+
+        return WebRTCClientConfiguration(configuration=RTCConfiguration(ice_servers=servers))
 
     async def async_handle_async_webrtc_offer(self, offer_sdp: str, session_id: str, send_message) -> None:
         if getattr(self, "_bridge", None) is None:
